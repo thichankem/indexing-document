@@ -114,6 +114,20 @@ def _noise_rects(page: fitz.Page, repeats: set[str],
     return rects, only_toc
 
 
+def _has_content(page: fitz.Page) -> bool:
+    """Trang còn lại thứ gì đáng giữ không — chữ, ảnh, hay nét vẽ.
+
+    `delete_image` của PyMuPDF không xoá hẳn ảnh mà thay nó bằng một ô trong
+    suốt 1x1, nên ảnh đã gỡ vẫn còn nguyên trong danh sách của trang. Phải đo
+    theo kích thước thật mới biết trang có còn gì hiện ra trên giấy hay không.
+    """
+    if len(page.get_text("text").strip()) >= EMPTY_PAGE_CHARS:
+        return True
+    if any(info[2] > 1 and info[3] > 1 for info in page.get_images(full=True)):
+        return True
+    return bool(page.get_drawings())
+
+
 def clean_pdf(src: str, dst: str, opts: CleanOptions | None = None) -> dict:
     """Tạo bản PDF sạch. Trả về thống kê những gì đã gỡ."""
     opts = opts or CleanOptions()
@@ -157,7 +171,14 @@ def clean_pdf(src: str, dst: str, opts: CleanOptions | None = None) -> dict:
             page.apply_redactions(images=1, graphics=0, text=0)
             removed_images += len(leftover)
 
-        # 2) Gỡ chữ ở đầu/chân trang và phần mục lục, không đụng tới hình
+        # 2) Trang bìa gỡ xong thường chẳng còn gì — bìa vốn chỉ có mỗi tấm ảnh.
+        #    Để lại thì bản sạch mở ra là một trang trắng trơn, và DLA đọc phải
+        #    một trang rỗng cũng chẳng biết làm gì với nó.
+        if drop and not _has_content(page):
+            blank_pages.append(pno)
+            continue
+
+        # 3) Gỡ chữ ở đầu/chân trang và phần mục lục, không đụng tới hình
         if not opts.touches_text:
             continue
         rects, only_toc = _noise_rects(page, repeats,
@@ -172,17 +193,24 @@ def clean_pdf(src: str, dst: str, opts: CleanOptions | None = None) -> dict:
         if only_toc and len(page.get_text("text").strip()) < EMPTY_PAGE_CHARS:
             blank_pages.append(pno)
 
-    # 3) Trang chỉ còn lại mục lục thì bỏ hẳn cho gọn
-    for pno in reversed(blank_pages):
+    # 4) Trang chỉ còn lại mục lục, hoặc trang bìa vừa bị gỡ sạch, thì bỏ hẳn
+    for pno in sorted(set(blank_pages), reverse=True):
         doc.delete_page(pno)
 
     os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
     # use_objstms gộp các đối tượng nhỏ vào luồng nén. Thiếu nó, file ghi ra
     # phình gần gấp đôi bản gốc dù nội dung đã bị gỡ bớt.
+    #
+    # garbage=1 chứ không phải 4: mức 4 bắt MuPDF băm nội dung *mọi* luồng để
+    # tìm luồng trùng nhau, và trên tài liệu nhiều ảnh cái giá đó là phút chứ
+    # không phải giây — 86s so với 0.1s trên bản Tràng An Fast Care. Đắt mà
+    # không được gì: ảnh nhiễu đã gỡ theo xref ở trên, nên mức 1 (bỏ đối tượng
+    # không còn ai tham chiếu) đã ra file *đúng bằng* mức 4 trên cả ba tài liệu
+    # nặng nhất (2.77 MB, 6.64 MB, 0.94 MB — giống nhau tới từng chữ số).
     try:
-        doc.save(dst, garbage=4, deflate=True, use_objstms=1)
+        doc.save(dst, garbage=1, deflate=True, use_objstms=1)
     except TypeError:  # bản PyMuPDF cũ chưa có tham số này
-        doc.save(dst, garbage=4, deflate=True)
+        doc.save(dst, garbage=1, deflate=True)
     pages_out = doc.page_count
     doc.close()
 

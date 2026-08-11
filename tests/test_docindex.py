@@ -693,6 +693,94 @@ def test_footnotes_are_dropped(processed):
         pytest.fail("thiếu file mẫu Xuân Thành")
 
 
+def _glyph_line(pieces, size=11.0, tracking=0.0):
+    """Dựng một dòng kiểu `rawdict`: mỗi từ một cụm glyph, dính sát nhau.
+
+    `tracking` là bề rộng của glyph dấu cách chèn giữa từng chữ cái — công cụ
+    làm phẳng PDF đặt nó gần bằng 0 nên trên giấy không thấy, còn dấu cách thật
+    giữa hai từ thì rộng 0.25 lần cỡ chữ như mọi font chữ có chân.
+    """
+    chars = []
+    x = 0.0
+
+    def put(ch, width):
+        nonlocal x
+        chars.append({"c": ch, "bbox": (x, 0.0, x + width, size)})
+        x += width
+
+    for index, word in enumerate(pieces):
+        if index:
+            put(" ", size * 0.25)
+        for pos, ch in enumerate(word):
+            if pos and tracking:
+                put(" ", tracking)
+            put(ch, size * 0.5)
+    return {"dir": (1.0, 0.0), "spans": [{"size": size, "chars": chars}]}
+
+
+def test_ghost_spaces_between_letters_are_dropped():
+    """Dấu cách rộng bằng 0 giữa từng chữ cái không được thành dấu cách thật.
+
+    File PDF đã "làm phẳng" đặt riêng vị trí cho mỗi glyph và nhét giữa hai chữ
+    cái một dấu cách gần như không có bề rộng. Đọc thẳng ra thì cả câu vỡ thành
+    "B á n , x á c" — chunk, tokenizer và bản dựng lại đều hỏng theo.
+    """
+    from docindex.extract_pdf import _rebuild_line
+
+    line = _glyph_line(["Bán,", "xác", "nhận"], tracking=0.2)
+    _rebuild_line(line)
+    assert line["spans"][0]["text"] == "Bán, xác nhận"
+
+
+def test_real_spaces_survive_the_ghost_space_filter():
+    """Dấu cách thật vẫn phải là dấu cách — kể cả khi nó khép lại một span.
+
+    Chữ có dấu thường lấy glyph từ font khác nên PyMuPDF cắt dòng thành nhiều
+    span, và dấu cách hay rơi đúng vào cuối một span ("QUY " | "ĐỊNH"). Đo
+    khoảng hở trong phạm vi từng span thì hai từ đó dính liền nhau.
+    """
+    from docindex.extract_pdf import _rebuild_line
+
+    line = _glyph_line(["QUY", "ĐỊNH", "NGÂN"])
+    chars = line["spans"][0]["chars"]
+    # cắt ngay trước "Đ": dấu cách đứng trước nó khép lại span thứ nhất
+    cut = next(i for i, c in enumerate(chars) if c["c"] == "Đ")
+    line["spans"] = [{"size": 11.0, "chars": chars[:cut]},
+                     {"size": 11.0, "chars": chars[cut:]}]
+    _rebuild_line(line)
+    assert "".join(s["text"] for s in line["spans"]) == "QUY ĐỊNH NGÂN"
+
+
+def test_no_letter_spaced_runs_survive(processed):
+    """Không chunk nào còn chuỗi chữ cái rời rạc kiểu "B á n , x á c n h ậ n"."""
+    spaced = re.compile(r"(?:\w ){6,}\w")
+    for path, chunks, _sections, _src, _st in processed:
+        for chunk in chunks:
+            found = spaced.search(chunk.raw_text)
+            assert not found, f"{os.path.basename(path)}: {found.group(0)!r}"
+
+
+def test_flattened_prose_is_not_sliced_into_a_table(processed):
+    """Đoạn văn xuôi không được đọc thành bảng.
+
+    Trang "Giải thích từ ngữ" của bản đã làm phẳng không có lấy một cái bảng —
+    chỉ là danh sách định nghĩa đánh số. Đoán khung bảng theo khoảng trắng thì
+    nó bị xẻ dọc thành mười cột, chữ đứt ngang từ nằm rải khắp các ô.
+    """
+    for path, chunks, sections, _src, _st in processed:
+        if "bán ngoại tệ tiền mặt_flattened" not in os.path.basename(path):
+            continue
+        blocks = [b for s in sections for b in s.blocks]
+        assert not [b for b in blocks
+                    if b.is_table and "Mức phải khai báo" in b.text]
+        body = re.sub(r"\s+", " ", " ".join(c.raw_text for c in chunks))
+        assert ("Là mức ngoại tệ tiền mặt hoặc Việt Nam đồng tiền mặt của cá "
+                "nhân mang theo khi xuất cảnh") in body
+        break
+    else:
+        pytest.fail("thiếu file mẫu đã làm phẳng")
+
+
 def test_footnote_zone_leaves_real_content_alone(processed):
     """Chỉ cắt chữ nhỏ ở đáy trang — nội dung cỡ chữ thường phải còn nguyên."""
     for path, chunks, _sections, _src, _st in processed:
@@ -717,6 +805,8 @@ def test_no_content_loss(processed):
     import docx
     import fitz
 
+    from docindex import extract_pdf
+
     dot = re.compile(r"\.{4,}")
 
     def words(s):
@@ -730,13 +820,19 @@ def test_no_content_loss(processed):
         nghĩa* của chúng — mạch chữ nhỏ liền đáy trang, dòng nằm sát mép trên
         và lặp gần như mọi trang — chứ không gọi vào code đang được kiểm tra,
         để test vẫn bắt được mọi chỗ mất chữ khác.
+
+        Bản gốc đọc qua `_page_dict` chứ không phải `get_text("dict")`: file đã
+        làm phẳng chứa dấu cách giả giữa từng chữ cái, nên bản thô cho ra "b",
+        "á", "n" là ba "từ" riêng. Lấy chuỗi đó làm mốc thì mọi câu được ghép
+        lại đúng chính tả đều bị tính là mất chữ. Đây chỉ là khâu đọc glyph,
+        còn việc khoanh vùng nhiễu ở dưới vẫn tự làm lấy.
         """
         doc = fitz.open(path)
         sizes = Counter()
         pages = []
         for page in doc:
             rows = []
-            for block in page.get_text("dict")["blocks"]:
+            for block in extract_pdf._page_dict(page)["blocks"]:
                 if block["type"] != 0:
                     continue
                 for line in block["lines"]:
@@ -823,21 +919,39 @@ def cleaned(tmp_path_factory):
     return results
 
 
-def test_output_keeps_the_source_file_name(cleaned):
-    """Tên file kết quả giữ nguyên tên gốc, không thêm hậu tố nào."""
+def test_output_marks_the_file_name_as_formalized(cleaned):
+    """Tên file kết quả giữ nguyên tên gốc kèm hậu tố `_formalized`."""
+    from docindex.export import FORMALIZED_SUFFIX
+
     for src, dst, _stats in cleaned:
-        assert os.path.basename(dst) == os.path.basename(src)
+        name, ext = os.path.splitext(os.path.basename(src))
+        assert os.path.basename(dst) == f"{name}{FORMALIZED_SUFFIX}{ext.lower()}"
 
 
-def test_output_refuses_to_overwrite_the_source():
-    """Tên file không còn hậu tố nên phải chặn việc ghi đè lên tài liệu gốc."""
-    from docindex.export import clean_document, out_path
+def test_output_does_not_repeat_the_suffix(tmp_path):
+    """Chạy lại trên bản đã chuẩn hóa thì hậu tố không nhân đôi."""
+    from docindex.export import FORMALIZED_SUFFIX, out_path
 
-    src = _docs()[0]
+    src = os.path.join(str(tmp_path), f"quy-dinh{FORMALIZED_SUFFIX}.pdf")
+    dst = out_path(src, os.path.join(str(tmp_path), "ra"), out_format="same")
+    assert os.path.basename(dst) == f"quy-dinh{FORMALIZED_SUFFIX}.pdf"
+
+
+def test_output_refuses_to_overwrite_the_source(tmp_path):
+    """Hậu tố không nhân đôi, nên bản đã chuẩn hóa vẫn có thể tự ghi đè."""
+    import fitz
+
+    from docindex.export import FORMALIZED_SUFFIX, clean_document, out_path
+
+    src = os.path.join(str(tmp_path), f"quy-dinh{FORMALIZED_SUFFIX}.pdf")
+    doc = fitz.open()
+    doc.new_page()
+    doc.save(src)
+    doc.close()
     with pytest.raises(ValueError, match="trùng file gốc"):
-        clean_document(src, os.path.dirname(src))
+        clean_document(src, str(tmp_path))
     with pytest.raises(ValueError, match="trùng file gốc"):
-        out_path(src, os.path.dirname(src), out_format="same")
+        out_path(src, str(tmp_path), out_format="same")
 
 
 def test_cleaned_output_keeps_source_format(cleaned):
@@ -914,6 +1028,200 @@ def test_cleaned_docx_keeps_body_and_clears_headers(cleaned):
         for section in after.sections:
             for part in (section.header, section.footer):
                 assert not "".join(p.text for p in part.paragraphs).strip()
+
+
+def test_faint_watermark_is_not_a_content_figure():
+    """Hoa văn chìm to bằng nửa trang vẫn phải bị xếp là nhiễu.
+
+    Nó lọt mọi ngưỡng kích thước và không lặp lại trang nào, nên dấu hiệu duy
+    nhất còn lại là nó không có lấy một nét đậm nào.
+    """
+    import fitz
+
+    from docindex.images import collect_pdf_images
+
+    checked = 0
+    for path in _docs():
+        if "Trọn Đời" not in os.path.basename(path):
+            continue
+        checked += 1
+        with fitz.open(path) as doc:
+            found = [i for items in collect_pdf_images(doc).values() for i in items
+                     if "hoa văn chìm" in i.reason]
+            assert found, "không nhận ra hoa văn chìm ở trang 3"
+            assert all(i.kind == "logo" for i in found)
+            # Ảnh còn lại ở trang 3 phải bị gỡ vì đúng lý do của nó. Trước đây
+            # chỗ này đòi trang 3 giữ được một hình nội dung, nhưng ảnh ấy là
+            # khung bo góc màu đỏ vẽ dưới một đoạn văn — 452 ký tự chữ sống của
+            # trang nằm đè lên nó — nên nó không phải hình.
+            for img in collect_pdf_images(doc).get(3, []):
+                assert img.kind != "figure", f"{img.reason} không phải hình nội dung"
+    if not checked:
+        pytest.skip("thiếu file mẫu Trọn Đời")
+
+
+def test_decorative_frame_is_not_a_content_figure():
+    """Khung bo góc vẽ dưới chữ là trang trí, còn sơ đồ thật phải sống sót.
+
+    Phép đo mực không tách được hai thứ này: khung chỉ có mấy nét đỏ trên nền
+    trong suốt nên gần như 100% số điểm không phải nền giấy đều là nét đậm, nó
+    chấm 0.67 ngang với sơ đồ dày đặc nhất. Cái tách được là chữ sống của trang
+    nằm đè lên khung, còn nhãn của sơ đồ thì nằm sẵn trong file ảnh.
+    """
+    import fitz
+
+    from docindex.images import collect_pdf_images
+
+    frames = diagrams = 0
+    for path in _docs():
+        name = os.path.basename(path)
+        if not path.lower().endswith(".pdf"):
+            continue
+        if "Trọn Đời" not in name and "Hưng Thịnh" not in name:
+            continue
+        with fitz.open(path) as doc:
+            for items in collect_pdf_images(doc).values():
+                for img in items:
+                    if "khung trang trí" in img.reason:
+                        frames += 1
+                        assert img.kind == "logo"
+                    if img.kind == "figure":
+                        diagrams += 1
+    if not frames:
+        pytest.skip("thiếu file mẫu Trọn Đời / Hưng Thịnh")
+    # Sơ đồ "Tài khoản hợp đồng" của bản Hưng Thịnh: nhãn nằm trong ảnh, không
+    # có chữ sống nào đè lên, nên nó không được rơi vào luật khung trang trí.
+    assert diagrams, "gỡ sạch cả sơ đồ nội dung"
+
+
+def test_the_ink_threshold_sits_in_a_real_gap():
+    """Ngưỡng mực phải nằm giữa một khoảng trống rộng, không sát mép ai cả.
+
+    Chỉ cần một hình nội dung nhạt màu rơi sát ngưỡng là lần đổi số tiếp theo sẽ
+    gỡ mất nó mà không ai biết. Đo trên bộ tài liệu thật: hoa văn ≤ 0.02, hình
+    nội dung ≥ 0.17 — ngưỡng 0.05 cách cả hai bên ít nhất ba lần.
+    """
+    import fitz
+
+    from docindex.images import (
+        WATERMARK_INK_RATIO, collect_pdf_images, dark_ink_ratio,
+    )
+
+    faint, solid = [], []
+    for path in _docs():
+        if not path.lower().endswith(".pdf"):
+            continue
+        with fitz.open(path) as doc:
+            for pno, items in collect_pdf_images(doc).items():
+                page = doc[pno - 1]
+                for img in items:
+                    if img.kind == "figure":
+                        solid.append(dark_ink_ratio(page, img.bbox))
+                    elif "hoa văn chìm" in img.reason:
+                        faint.append(dark_ink_ratio(page, img.bbox))
+    assert solid, "không có hình nội dung nào để đối chiếu"
+    assert min(solid) > WATERMARK_INK_RATIO * 3, (
+        f"hình nội dung nhạt nhất chỉ có {min(solid):.3f} mực, sát ngưỡng"
+    )
+    if faint:
+        assert max(faint) < WATERMARK_INK_RATIO / 2, (
+            f"hoa văn đậm nhất đã lên tới {max(faint):.3f} mực, sát ngưỡng"
+        )
+
+
+# --- chọn riêng từng thứ cần gỡ -------------------------------------------
+
+ONLY_IMAGES = dict(drop_logo=True, drop_cover=True,
+                   drop_header_footer=False, drop_toc=False)
+
+
+@pytest.fixture(scope="module")
+def cleaned_images_only(tmp_path_factory):
+    """Mức mặc định của giao diện: chỉ gỡ logo và ảnh bìa, chữ để nguyên."""
+    from docindex.export import CleanOptions, clean_document, out_dir_for
+
+    out = tmp_path_factory.mktemp("images-only")
+    results = []
+    for path in _docs():
+        dst_dir = out_dir_for(path, TEST_DIR, str(out))
+        os.makedirs(dst_dir, exist_ok=True)
+        dst, stats = clean_document(path, dst_dir, opts=CleanOptions(**ONLY_IMAGES))
+        results.append((path, dst, stats))
+    return results
+
+
+def test_keeping_text_leaves_every_character_in_place(cleaned_images_only):
+    """Tắt gỡ chữ thì bản sạch phải còn nguyên từng ký tự của bản gốc.
+
+    Đây là điều người dùng trông đợi khi chỉ tick gỡ ảnh: file nhẹ đi nhưng mở
+    ra vẫn đúng từng trang, từng dòng như tài liệu gốc.
+    """
+    import fitz
+
+    checked = 0
+    for src, dst, stats in cleaned_images_only:
+        if not src.lower().endswith(".pdf"):
+            continue
+        checked += 1
+        assert stats["text_zones_removed"] == 0
+        assert stats["pages_removed"] == 0
+        with fitz.open(src) as before, fitz.open(dst) as after:
+            assert after.page_count == before.page_count
+            for old, new in zip(before, after):
+                assert new.get_text("text") == old.get_text("text"), (
+                    f"{os.path.basename(dst)} trang {new.number + 1}: chữ bị đổi"
+                )
+    assert checked, "không có PDF nào để kiểm tra"
+
+
+def test_keeping_text_still_drops_the_logos(cleaned_images_only, cleaned):
+    """Bỏ gỡ chữ không được làm mất luôn phần gỡ ảnh."""
+    full = {src: stats for src, _dst, stats in cleaned}
+    dropped = 0
+    for src, _dst, stats in cleaned_images_only:
+        assert stats["images_removed"] == full[src]["images_removed"]
+        dropped += stats["images_removed"]
+    assert dropped, "không tài liệu nào có logo để gỡ"
+
+
+def test_keeping_images_leaves_them_in_the_file(tmp_path):
+    """Bỏ tick cả hai ô ảnh thì không ảnh nào bị gỡ."""
+    from docindex.export import CleanOptions, clean_document, out_dir_for
+
+    opts = CleanOptions(drop_logo=False, drop_cover=False,
+                        drop_header_footer=False, drop_toc=False)
+    checked = 0
+    for path in _docs():
+        dst_dir = out_dir_for(path, TEST_DIR, str(tmp_path))
+        os.makedirs(dst_dir, exist_ok=True)
+        _dst, stats = clean_document(path, dst_dir, opts=opts)
+        assert stats["images_removed"] == 0
+        checked += 1
+    assert checked
+
+
+def test_cleaned_docx_can_keep_its_header_text(tmp_path):
+    """Gỡ logo trong header nhưng chữ ở header vẫn còn.
+
+    Logo công ty gần như luôn nằm trong header, nên "chỉ gỡ logo" bắt buộc phải
+    đụng vào header mà không được cuốn theo dòng chữ ở đó.
+    """
+    import docx
+
+    from docindex.export import CleanOptions, clean_docx
+
+    src = os.path.join(str(tmp_path), "co-header.docx")
+    document = docx.Document()
+    document.add_paragraph("Thân bài giữ nguyên.")
+    document.sections[0].header.paragraphs[0].text = "Ban hành kèm Quyết định 01"
+    document.save(src)
+
+    dst = os.path.join(str(tmp_path), "ra.docx")
+    clean_docx(src, dst, CleanOptions(**ONLY_IMAGES))
+    after = docx.Document(dst)
+    header = "".join(p.text for p in after.sections[0].header.paragraphs)
+    assert "Ban hành kèm Quyết định 01" in header
+    assert "Thân bài giữ nguyên." in "".join(p.text for p in after.paragraphs)
 
 
 # --- dựng lại bố cục: mỗi mục một trang -----------------------------------

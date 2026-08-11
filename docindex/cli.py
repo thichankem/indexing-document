@@ -10,7 +10,7 @@ from .chunker import MAX_TOKENS, MIN_TOKENS, ChunkConfig
 from .export import CleanOptions, clean_document, out_dir_for, rebuild_document
 from .models import document_title
 from .pipeline import iter_input_files, process_file
-from .report import check, format_outline, format_report
+from .report import check, format_outline, format_report, scanned_warning
 
 
 def _stdout_utf8() -> None:
@@ -132,6 +132,11 @@ def main(argv: list[str] | None = None) -> int:
             failed += 1
             print(f"  [LỖI] {type(exc).__name__}: {exc}")
             continue
+
+        # Bản scan thì mọi thứ phía sau đều vô nghĩa — nói ngay, trước khi bỏ
+        # công dựng lại cả tài liệu.
+        if scanned_warning(extract_stats):
+            print("  [!] bản scan, chưa có lớp text — xem cảnh báo đầy đủ ở dưới")
 
         # Bản tài liệu đã làm sạch
         if not args.no_clean:
