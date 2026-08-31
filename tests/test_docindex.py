@@ -1,4 +1,8 @@
-"""Kiểm tra các ràng buộc cốt lõi của tool trên bộ tài liệu thật."""
+"""Check the tool's core constraints against a corpus of real documents.
+
+The fixture text is Vietnamese because that is the language of the documents
+this tool processes; test names, docstrings and assertion messages are English.
+"""
 from __future__ import annotations
 
 import os
@@ -17,7 +21,8 @@ from docindex.headings import (
 )
 from docindex.images import CAPTION, DocImage
 from docindex.models import (
-    Block, Section, clean_text, normalize_symbols, rows_to_markdown,
+    PREAMBLE_TITLE, Block, Section, clean_text, normalize_symbols,
+    rows_to_markdown,
 )
 from docindex.numbering import _format_counter, _to_letter, _to_roman
 from docindex.pipeline import iter_input_files, process_file
@@ -28,10 +33,10 @@ CFG = ChunkConfig()
 
 def _docs():
     if not os.path.isdir(TEST_DIR):
-        pytest.skip("thư mục 'testing file' không tồn tại")
+        pytest.skip("the 'testing file' folder does not exist")
     files = iter_input_files(TEST_DIR)
     if not files:
-        pytest.skip("không có file pdf/docx để kiểm tra")
+        pytest.skip("no pdf/docx files available to test against")
     return files
 
 
@@ -45,7 +50,7 @@ def processed():
     return out
 
 
-# --- đơn vị nhỏ ---------------------------------------------------------
+# --- unit level ---------------------------------------------------------
 
 def test_roman_and_letter_counters():
     assert _to_roman(4) == "iv"
@@ -69,7 +74,7 @@ def test_heading_patterns():
 
 
 def test_reference_phrase_is_not_a_heading():
-    """Mảnh câu dẫn chiếu từng bị nhận nhầm và nuốt trọn các mục phía sau."""
+    """A cross-reference fragment once matched and swallowed every section after it."""
     blocks = [
         Block(text="Phần 1 này", page=1, bold=False),
         Block(text="ĐIỀU 3: PHÍ BẢO HIỂM", page=1, bold=True),
@@ -92,18 +97,19 @@ def test_split_table_repeats_header():
     assert all(p.startswith("| A | B |") for p in parts)
 
 
-# --- ràng buộc trên tài liệu thật ---------------------------------------
+# --- constraints on real documents --------------------------------------
 
 def test_every_document_produces_chunks(processed):
     for path, chunks, _sections, _src, _st in processed:
-        assert chunks, f"không tạo được chunk nào cho {os.path.basename(path)}"
+        assert chunks, f"no chunks produced for {os.path.basename(path)}"
 
 
 def test_chunk_never_spans_two_pages(processed):
-    """Ràng buộc chính: nội dung trong một chunk phải cùng thuộc một trang.
+    """The core constraint: everything in one chunk comes from a single page.
 
-    Đối chiếu từng dòng của chunk với trang gốc của nó trong tài liệu. Dòng nào
-    chỉ xuất hiện ở một trang duy nhất mà khác trang của chunk là lỗi.
+    Each line of a chunk is matched against the page it came from in the
+    document. A line that occurs on exactly one page, but not the chunk's page,
+    is a bug.
     """
     for path, chunks, sections, _src, _st in processed:
         pages_of_line: dict[str, set[int]] = {}
@@ -121,13 +127,13 @@ def test_chunk_never_spans_two_pages(processed):
                 pages = pages_of_line.get(line)
                 if pages and len(pages) == 1:
                     assert chunk.page in pages, (
-                        f"{os.path.basename(path)} {chunk.chunk_id}: dòng thuộc trang "
-                        f"{pages} nhưng chunk khai báo trang {chunk.page}"
+                        f"{os.path.basename(path)} {chunk.chunk_id}: line belongs to "
+                        f"page {pages} but the chunk declares page {chunk.page}"
                     )
 
 
 def test_chunk_never_exceeds_token_limit(processed):
-    """Ràng buộc cứng của hệ RAG: 512 token. Vượt là bị cắt cụt lúc embedding."""
+    """The RAG stack's hard limit: 512 tokens. Over it, embedding truncates."""
     for path, chunks, _sections, _src, _st in processed:
         for chunk in chunks:
             assert chunk.est_tokens <= CFG.max_tokens, (
@@ -138,10 +144,10 @@ def test_chunk_never_exceeds_token_limit(processed):
 
 
 def test_token_estimate_is_not_optimistic():
-    """Ước lượng token phải cao hơn thực tế, không được thấp hơn.
+    """The token estimate must run high, never low.
 
-    Đếm thiếu thì chunk lọt qua mọi kiểm tra rồi mới bị cắt cụt ở khâu
-    embedding — hỏng âm thầm, nên thà ước lượng dư.
+    Undercount and a chunk passes every check here, only to be truncated at
+    embedding time — a silent failure, so overestimating is the safe side.
     """
     plain = "Khách hàng cá nhân ưu tiên được hưởng chính sách lãi suất ưu đãi."
     assert est_tokens(plain) >= len(plain.split())
@@ -167,7 +173,7 @@ def test_chunk_links_are_consistent(processed):
 
 
 def test_continuation_flags_match_section(processed):
-    """is_continued chỉ đúng khi chunk kế tiếp thuộc cùng một mục."""
+    """is_continued holds only when the next chunk belongs to the same section."""
     for _path, chunks, _sections, _src, _st in processed:
         by_id = {c.chunk_id: c for c in chunks}
         for chunk in chunks:
@@ -188,26 +194,26 @@ def test_section_path_starts_the_text(processed):
 
 
 def test_most_chunks_belong_to_a_section(processed):
-    """Nếu nhận diện tiêu đề hỏng, phần lớn chunk sẽ rơi vào 'Phần mở đầu'."""
+    """When heading detection breaks, most chunks fall into the preamble."""
     for path, chunks, _sections, _src, _st in processed:
-        orphan = [c for c in chunks if c.section_path == "Phần mở đầu"]
+        orphan = [c for c in chunks if c.section_path == PREAMBLE_TITLE]
         assert len(orphan) <= max(2, len(chunks) * 0.15), os.path.basename(path)
 
 
 def test_headings_are_detected(processed):
     for path, _chunks, sections, _src, _st in processed:
         numbered = [s for s in sections if s.number]
-        assert numbered, f"không nhận được tiêu đề nào trong {os.path.basename(path)}"
+        assert numbered, f"no headings detected in {os.path.basename(path)}"
 
 
 def test_no_dot_leader_garbage(processed):
-    """Trang mục lục phải bị loại, không sinh chunk toàn dấu chấm."""
+    """TOC pages must be dropped, never yielding a chunk full of dot leaders."""
     for _path, chunks, _sections, _src, _st in processed:
         for chunk in chunks:
             assert "........" not in chunk.text
 
 
-# --- lọc logo / giữ hình minh hoạ ---------------------------------------
+# --- dropping logos / keeping figures ------------------------------------
 
 def test_caption_pattern():
     assert CAPTION.match("Hình 1: Quy trình xử lý")
@@ -225,9 +231,9 @@ def test_figure_placeholder_format():
 
 
 def test_logos_are_dropped_and_not_in_text(processed):
-    """Logo lặp ở đầu/cuối trang không được lọt vào nội dung chunk."""
+    """A logo repeated in the header or footer must never reach a chunk."""
     total_logos = sum(st.get("logos_dropped", 0) for _p, _c, _s, _src, st in processed)
-    assert total_logos > 0, "không loại được logo nào trên bộ tài liệu thật"
+    assert total_logos > 0, "no logos were dropped across the real corpus"
 
     for _path, chunks, _sections, _src, _st in processed:
         for chunk in chunks:
@@ -238,9 +244,9 @@ def test_logos_are_dropped_and_not_in_text(processed):
 
 
 def test_figures_are_kept_with_metadata(processed):
-    """Hình nội dung phải được giữ chỗ kèm metadata, không bị xoá nhầm."""
+    """Content figures keep a placeholder plus metadata, and are never dropped."""
     with_fig = [c for _p, chunks, _s, _src, _st in processed for c in chunks if c.has_figure]
-    assert with_fig, "không giữ được hình minh hoạ nào"
+    assert with_fig, "no figures were kept"
     for chunk in with_fig:
         assert chunk.figures
         assert "[FIGURE:" in chunk.raw_text
@@ -252,15 +258,15 @@ def test_figure_flag_matches_content(processed):
     for _path, chunks, _sections, _src, _st in processed:
         for chunk in chunks:
             if "[FIGURE:" in chunk.raw_text:
-                assert chunk.has_figure, f"{chunk.chunk_id} có hình nhưng không đánh dấu"
+                assert chunk.has_figure, f"{chunk.chunk_id} holds a figure but is not flagged"
 
 
 def test_letter_marker_nests_under_decimal():
-    """"a)" là mục con của "2.", không phải anh em của nó.
+    """"a)" is a child of "2.", not its sibling.
 
-    Tài liệu Word thật hay khai danh sách "a) b) c)" ở cùng cấp `ilvl` với
-    "1. 2. 3.". Tin theo cấp đó thì cây chỉ mục bị phẳng, và title của mọi
-    chunk bên dưới mất một tầng.
+    Real Word documents routinely declare an "a) b) c)" list at the same `ilvl`
+    as "1. 2. 3.". Trust that level and the outline flattens, costing every
+    chunk below it a tier of its title.
     """
     from docindex.headings import build_sections
 
@@ -277,10 +283,11 @@ def test_letter_marker_nests_under_decimal():
 
 
 def test_sentence_starting_with_a_number_is_not_a_heading():
-    """"30 (ba mươi) ngày tuổi…" là câu văn bị PDF cắt dòng, không phải mục 30.
+    """"30 (ba mươi) ngày tuổi…" is prose wrapped by the PDF, not section 30.
 
-    Nhận nhầm một dòng như vậy không chỉ đẻ ra mục ma: mọi mục thật phía sau
-    tụt xuống làm con của nó và title của cả nhánh sai theo.
+    Mistaking a line like that does more than spawn a phantom section: every
+    real section after it drops down to become its child, and the titles of the
+    whole branch go wrong with it.
     """
     from docindex.headings import build_sections
 
@@ -295,11 +302,11 @@ def test_sentence_starting_with_a_number_is_not_a_heading():
     assert blocks[1].kind != "heading"
     sections = build_sections(blocks)
     assert [s.number for s in sections] == ["1.25", "1.26"]
-    assert [s.level for s in sections] == [1, 1], "mục thật bị tụt cấp"
+    assert [s.level for s in sections] == [1, 1], "a real section was demoted"
 
 
 def test_padded_number_is_a_quantity_not_an_index():
-    """"04 (bốn) Năm hợp đồng" là số lượng — chỉ mục không đệm số 0."""
+    """"04 (bốn) Năm hợp đồng" is a quantity — section numbers are never zero-padded."""
     blocks = [
         Block(text="3.1 Quy định chung về Phí bảo hiểm", page=1, bold=True),
         Block(text="04 (bốn) Năm hợp đồng đầu tiên.", page=1, bold=True),
@@ -311,7 +318,7 @@ def test_padded_number_is_a_quantity_not_an_index():
 
 
 def test_missing_parent_heading_does_not_drop_the_subtree():
-    """Tiêu đề cha bị trích xuất sót thì mục con vẫn phải được giữ."""
+    """When extraction misses a parent heading, its children must still survive."""
     blocks = [
         Block(text="2.2.5 Nội dung mục con cuối", page=1, bold=True),
         Block(text="2.3.1 Nội dung mục con đầu của nhánh sau", page=1, bold=True),
@@ -321,31 +328,32 @@ def test_missing_parent_heading_does_not_drop_the_subtree():
 
 
 def test_section_name_stops_at_the_colon():
-    """Tên mục là phần trước dấu hai chấm, dù cả dòng chưa dài quá trần.
+    """The section name ends at the colon, even when the line is under the ceiling.
 
-    Văn bản hành chính viết liền cả câu vào dòng tiêu đề. Để nguyên thì cả câu
-    bị in đậm cỡ tiêu đề và title của mọi chunk trong mục đọc như văn xuôi.
+    Administrative documents run whole sentences into the heading line. Left
+    alone, the sentence is set in bold at heading size and every chunk title in
+    the section reads like prose.
     """
     assert shorten_title(
         "Hợp đồng bảo hiểm: là tất cả văn bản thể hiện sự thỏa thuận giữa hai bên"
     ) == "Hợp đồng bảo hiểm"
     assert shorten_title("Điều kiện áp dụng:") == "Điều kiện áp dụng"
-    # dấu hai chấm giữa một câu dài thì không phải ranh giới tên mục
+    # a colon mid-way through a long sentence is not a name boundary
     long_head = "Trường hợp Khách hàng " + "rất dài " * 20
     assert shorten_title(long_head + ": nội dung") != long_head.strip()
-    # không cắt trúng giờ giấc hay tỉ lệ
+    # do not cut on a clock time or a ratio
     assert shorten_title("Khung 8:30 tới 17:00") == "Khung 8:30 tới 17:00"
 
 
 def test_run_on_heading_moves_its_body_down(processed):
-    """Phần viết liền sau tên mục phải nằm ở thân bài, không phải ở dòng tiêu đề."""
+    """Text run into the heading line belongs in the body, not on the heading."""
     from docindex.layout import _content_items, _heading_and_rest
 
     checked = 0
     for _path, _chunks, sections, _src, _st in processed:
         for section in sections:
-            # Mục đã gộp chỉ mục mang tên của nhiều tiêu đề cộng lại nên dài
-            # hơn dòng tiêu đề gốc của chính nó — đó là chủ ý, không phải lỗi
+            # A section with merged numbers carries several names joined, so it
+            # runs longer than its own original heading line — by design, not a bug
             if ":" not in section.full_heading or not section.number or section.is_merged:
                 continue
             name, rest = _heading_and_rest(section)
@@ -353,14 +361,14 @@ def test_run_on_heading_moves_its_body_down(processed):
                 continue
             checked += 1
             assert len(name) <= len(section.full_heading)
-            assert ":" not in name.rstrip(":"), f"tên mục còn dính nội dung: {name!r}"
+            assert ":" not in name.rstrip(":"), f"content still stuck to the name: {name!r}"
             body = " ".join(i.text for i in _content_items(section, True))
-            assert rest.split()[0] in body, "phần viết liền bị rơi khỏi thân bài"
-    assert checked, "không có mục nào viết liền nội dung để kiểm tra"
+            assert rest.split()[0] in body, "the run-on text fell out of the body"
+    assert checked, "no section runs content into its heading, nothing to check"
 
 
 def test_hyphenated_word_split_across_lines_is_rejoined():
-    """"…và Dai-" ở cuối dòng nối với "ichi Life…" thành "Dai-ichi Life"."""
+    """"…và Dai-" at the end of a line joins "ichi Life…" into "Dai-ichi Life"."""
     from docindex.extract_pdf import _merge_wrapped
 
     lines = [
@@ -375,7 +383,7 @@ def test_hyphenated_word_split_across_lines_is_rejoined():
 
 
 def test_short_sections_are_merged_without_losing_text():
-    """Mục ngắn bị gộp thì mất nút trong cây, nhưng không được mất chữ."""
+    """Merging a short section loses its node in the tree, but never its words."""
     from docindex.headings import build_sections, merge_short_sections
 
     blocks = [
@@ -388,37 +396,37 @@ def test_short_sections_are_merged_without_losing_text():
     assert len(sections) == 3
 
     merged = merge_short_sections(sections, min_tokens=60, max_tokens=512)
-    assert len(merged) == 1, "mục ngắn chưa được gộp"
+    assert len(merged) == 1, "the short sections were not merged"
     text = merged[0].heading_text + " " + " ".join(b.text for b in merged[0].blocks)
     for word in ("Bệnh", "sức khỏe kém", "Khoản nợ", "đến hạn"):
-        assert word in text, f"mất chữ khi gộp: {word}"
+        assert word in text, f"word lost during the merge: {word}"
 
     kept = merge_short_sections(sections, min_tokens=0, max_tokens=512)
-    assert len(kept) == 3, "min_tokens=0 thì không được gộp gì"
+    assert len(kept) == 3, "min_tokens=0 must merge nothing"
 
 
 def test_upper_roman_ranks_above_decimal():
-    """"I. THÔNG TIN CHUNG" là cấp lớn, đứng trên "10. Điều kiện"."""
+    """"I. THÔNG TIN CHUNG" is a high level, ranking above "10. Điều kiện"."""
     assert _match_heading("I. THÔNG TIN CHUNG")[2] < _match_heading("10. Điều kiện")[2]
     assert _match_heading("I. THÔNG TIN CHUNG")[3] == "roman-upper"
 
 
 def test_bare_lowercase_i_stays_inside_the_letter_list():
-    """"i)" giữa danh sách a) b) c)… là mục thứ 9, không phải một cấp mới."""
+    """"i)" inside an a) b) c)… list is the ninth item, not a new level."""
     assert _match_heading("i) Đơn phương hủy bỏ")[2] == _match_heading("h) Nội dung")[2]
-    # còn "(i)" trong ngoặc thì đúng là cấp sâu nhất
+    # while a bracketed "(i)" really is the deepest level
     assert _match_heading("(i) Đơn phương hủy bỏ")[2] > _match_heading("a) Nội dung")[2]
 
 
 def test_letter_marker_keeps_its_separator():
-    """Ký hiệu đầu mục phải giữ nguyên dấu ("c." chứ không thành "c")."""
+    """An item marker keeps its punctuation ("c.", never bare "c")."""
     assert _match_heading("c. Ngày đáo hạn hợp đồng")[0] == "c."
     assert _match_heading("a) Hội viên gắn kết")[0] == "a)"
     assert _match_heading("(i) Đơn phương hủy bỏ")[0] == "(i)"
 
 
 def test_heading_line_not_duplicated_in_chunk(processed):
-    """Tiêu đề đã nằm ở tiền tố thì không lặp lại ngay dòng dưới."""
+    """A heading already in the prefix is not repeated on the line below."""
     for _path, chunks, _sections, _src, _st in processed:
         for chunk in chunks:
             lines = [l for l in chunk.text.split("\n") if l.strip()]
@@ -435,28 +443,28 @@ def test_shorten_title_keeps_meaning():
 
 
 def test_flattened_table_row_names_the_section_by_its_content():
-    """Hàng bảng làm phẳng: tên mục là giá trị mang nghĩa, không phải tên cột.
+    """Flattened table row: the name is the meaningful value, not a column label.
 
-    Bước tiền xử lý bên ngoài trải mỗi hàng bảng thành một dòng
-    "STT: 3.1 | Nội dung: Đối tượng khách hàng | Cụ thể: …". Cắt tại dấu hai
-    chấm đầu tiên như tiêu đề thường thì mọi hàng đều mang tên "STT" và cây chỉ
-    mục không còn phân biệt được mục nào với mục nào.
+    An external preprocessing step spreads each table row onto one line,
+    "STT: 3.1 | Nội dung: Đối tượng khách hàng | Cụ thể: …". Cutting at the first
+    colon, as for an ordinary heading, names every row "STT" and the outline can
+    no longer tell one section from another.
     """
     row = "STT: 3.1 | Nội dung: Đối tượng khách hàng | Cụ thể:"
     assert shorten_title(row) == "Đối tượng khách hàng"
-    # cột số thứ tự bị bỏ qua dù đứng ở đâu
+    # the index column is skipped wherever it appears
     assert shorten_title("Nội dung: Điều kiện vay | STT: 3.2") == "Điều kiện vay"
-    # không còn cột nào ngắn thì mới lấy tới cột nội dung dài
+    # only when no short column is left does a long content column get used
     long_row = "STT: 3.5 | Nội dung: | Cụ thể: Lãi suất theo quy định của Ngân hàng"
     assert shorten_title(long_row) == "Lãi suất theo quy định của Ngân hàng"
-    # hàng nối tiếp, mọi cột đều trống -> mục không có tên, chỉ còn số
+    # a continuation row with every column blank -> no name, only the number
     assert shorten_title("STT: | Nội dung: | Cụ thể:") == ""
-    # tiêu đề thường có dấu sổ đứng thì vẫn cắt theo luật cũ
+    # an ordinary heading containing a pipe still follows the original rule
     assert shorten_title("Hợp đồng bảo hiểm: là văn bản thỏa thuận") == "Hợp đồng bảo hiểm"
 
 
 def test_tree_stops_at_level_three():
-    """Từ cấp 4 ("1.1.1.1") trở xuống không vào cây nữa, thành nội dung thường."""
+    """From level 4 ("1.1.1.1") down, headings leave the tree and become content."""
     lines = ["1. Phạm vi", "1.1 Đối tượng", "1.1.1 Cá nhân",
              "1.1.1.1 Đủ 18 tuổi trở lên", "1.1.1.1.1 Sâu hơn nữa", "1.2 Loại tiền"]
     blocks = [Block(text=t, page=1, bold=True) for t in lines]
@@ -466,27 +474,27 @@ def test_tree_stops_at_level_three():
         (1, "1 Phạm vi"), (2, "1.1 Đối tượng"),
         (3, "1.1.1 Cá nhân"), (2, "1.2 Loại tiền"),
     ]
-    # hai dòng cấp 4/5 nằm lại làm nội dung của mục cấp 3, giữ nguyên số mục
+    # the level 4/5 lines stay as content of the level 3 section, numbers intact
     body = [b.text for b in sections[2].blocks]
     assert body == ["1.1.1.1 Đủ 18 tuổi trở lên", "1.1.1.1.1 Sâu hơn nữa"]
 
 
 def test_demoted_heading_keeps_its_number_from_word_numbering():
-    """DOCX giữ số mục ngoài text: hạ cấp mà quên ghép lại là mất số."""
+    """DOCX keeps the number outside the text: demote without splicing and it is lost."""
     from docindex.headings import _demote
 
     block = Block(text="Đủ 18 tuổi trở lên", page=1, number="1.1.1.1", kind="heading")
     _demote(block)
     assert block.text == "1.1.1.1 Đủ 18 tuổi trở lên"
     assert block.kind == "para" and block.number is None
-    # PDF thì số đã nằm sẵn trong text, không được ghép thêm lần nữa
+    # in a PDF the number is already in the text and must not be spliced twice
     pdf_block = Block(text="1.1.1.1 Đủ 18 tuổi", page=1, number="1.1.1.1", kind="heading")
     _demote(pdf_block)
     assert pdf_block.text == "1.1.1.1 Đủ 18 tuổi"
 
 
 def test_merging_a_short_section_adds_up_the_index():
-    """Gộp 1.2 vào 1.1 thì chỉ mục cộng vào, không chỉ gộp mỗi nội dung."""
+    """Merging 1.2 into 1.1 adds up the numbers, it does not merge content alone."""
     from docindex.headings import merge_short_sections
 
     def sect(number, title, body):
@@ -503,11 +511,11 @@ def test_merging_a_short_section_adds_up_the_index():
     assert out[0].number == "1.1 + 1.2"
     assert out[0].title == "Mục đích + Loại tiền"
     assert out[0].path == ["1. Gốc", "1.1 + 1.2 Mục đích + Loại tiền"]
-    assert "ngắn" in " ".join(b.text for b in out[0].blocks), "mất nội dung mục bị gộp"
+    assert "ngắn" in " ".join(b.text for b in out[0].blocks), "absorbed content lost"
 
 
 def test_short_section_stays_separate_when_the_merge_would_bust_the_limit():
-    """Gộp mà vượt 512 token thì vẫn phải tách ra."""
+    """A merge that would exceed 512 tokens must leave the sections apart."""
     from docindex.headings import merge_short_sections
 
     def sect(number, body):
@@ -515,17 +523,17 @@ def test_short_section_stays_separate_when_the_merge_would_bust_the_limit():
                        path=["1. Gốc", f"{number} T"], full_heading=f"{number} T",
                        blocks=[Block(text=body, page=1)], page_start=1, page_end=1)
 
-    almost_full = "chữ " * 470        # ~500 token, gộp thêm là tràn
+    almost_full = "chữ " * 470        # ~500 tokens; anything more overflows
     out = merge_short_sections([sect("1.1", almost_full), sect("1.2", "ngắn")],
                                min_tokens=60, max_tokens=512)
     assert [s.number for s in out] == ["1.1", "1.2"]
 
 
 def test_merge_room_counts_the_path_prefix():
-    """Trần 512 là trần của chunk, mà chunk còn mang cả tiền tố mục lục.
+    """The 512 ceiling is the chunk's, and a chunk also carries the outline prefix.
 
-    Bỏ quên tiền tố thì mục gộp xong vẫn bị khâu chunk cắt làm đôi — gộp thành
-    công cốc, lại còn đẻ ra hai chunk mang cùng một cái tên.
+    Forget the prefix and the merged section is split in two by the chunker
+    anyway — the merge achieves nothing and produces two chunks with one name.
     """
     from docindex.headings import merge_short_sections
 
@@ -536,14 +544,14 @@ def test_merge_room_counts_the_path_prefix():
                        path=long_path + [f"{number} T"], full_heading=f"{number} T",
                        blocks=[Block(text=body, page=1)], page_start=1, page_end=1)
 
-    # 330 + 60 = 390 < 512 nếu bỏ qua tiền tố, nhưng tiền tố ngốn ~150 token
+    # 330 + 60 = 390 < 512 ignoring the prefix, but the prefix eats ~150 tokens
     out = merge_short_sections([sect("1.1", "chữ " * 310), sect("1.2", "chữ " * 55)],
                                min_tokens=200, max_tokens=512)
-    assert [s.number for s in out] == ["1.1", "1.2"], "gộp xong sẽ bị cắt lại làm đôi"
+    assert [s.number for s in out] == ["1.1", "1.2"], "merging would only be split again"
 
 
 def test_merged_titles_do_not_bloat_the_path():
-    """Gộp nhiều mục thì số giữ đủ, còn tên bị chặn để tiền tố chunk không phình."""
+    """Merging many sections keeps every number; names are capped so the prefix stays small."""
     from docindex.headings import MAX_TITLE_IN_PATH, merge_short_sections
 
     sections = [
@@ -554,20 +562,20 @@ def test_merged_titles_do_not_bloat_the_path():
     ]
     out = merge_short_sections(sections, min_tokens=60, max_tokens=512)
     assert len(out) == 1
-    assert out[0].number == "1.1 + 1.2 + 1.3 + 1.4 + 1.5 + 1.6", "số mục phải giữ đủ"
+    assert out[0].number == "1.1 + 1.2 + 1.3 + 1.4 + 1.5 + 1.6", "every number must be kept"
     assert len(out[0].title) <= MAX_TITLE_IN_PATH + 4
     assert out[0].title.endswith("…")
 
 
 def test_flattened_row_with_a_missing_column_label():
-    """Bước làm phẳng rơi mất nhãn một cột thì cả ô đó chính là giá trị."""
+    """When flattening loses a column's label, the whole cell is the value."""
     assert shorten_title("Khoản: 3.1 | Điều kiện vay vốn | Quy định:") == "Điều kiện vay vốn"
     assert (shorten_title("Khoản: 3.13 | Điều kiện tái cấp Hạn mức | Quy định: a. Trước")
             == "Điều kiện tái cấp Hạn mức")
 
 
 def test_continuation_row_is_not_named_after_its_column():
-    """Hàng nối tiếp chỉ còn trơ một cột: "Quy định" là tên cột, không phải tên mục."""
+    """A continuation row down to one column: "Quy định" is a label, not a name."""
     rows = [
         "3.1.1 Khoản: 3.1 | Điều kiện: Mục đích cho vay | Quy định: Cho vay bổ sung",
         "3.1.2 Quy định:",
@@ -578,26 +586,26 @@ def test_continuation_row_is_not_named_after_its_column():
     sections = [s for s in build_sections(detect_headings(blocks, "pdf"))
                 if not s.is_preamble]
     assert [s.title for s in sections] == [
-        "Mục đích cho vay",     # hàng đủ cột
-        "",                     # hàng nối tiếp rỗng
-        "",                     # hàng nối tiếp mang nội dung tràn, không có tên
-        "Việt Nam đồng",        # hàng nối tiếp nhưng giá trị đủ ngắn để làm tên
+        "Mục đích cho vay",     # a full row
+        "",                     # an empty continuation row
+        "",                     # a continuation row of overflow text, with no name
+        "Việt Nam đồng",        # a continuation row whose value is short enough to name it
     ]
-    # không có bảng làm phẳng thì "Quy định:" vẫn là một tên mục bình thường
+    # with no flattened table around, "Quy định:" is an ordinary section name
     plain = [Block(text="3.1.2 Quy định:", page=1, bold=True)]
     plain_sections = build_sections(detect_headings(plain, "pdf"))
     assert plain_sections[0].title == "Quy định"
 
 
 def test_appendix_code_in_a_reference_is_not_a_heading():
-    """"…theo Phụ lục số PL01.1016.PDS.2026(1);" là câu dẫn chiếu, không phải mục."""
+    """"…theo Phụ lục số PL01.1016.PDS.2026(1);" is a reference, not a section."""
     assert _match_heading("PL01.1016.PDS.2026(1);") is None
     hit = _match_heading("PL02.1003.PCS.2026(1): Giải thích từ ngữ")
     assert hit[0] == "PL02.1003.PCS.2026(1)" and hit[1] == "Giải thích từ ngữ"
 
 
 def test_numbered_appendix_is_not_named_after_itself():
-    """"Phụ lục 01" không có tên riêng — đường dẫn không được thành "Phụ lục 01 Phụ lục 01"."""
+    """"Phụ lục 01" has no name of its own — the path must not double it up."""
     blocks = [Block(text="Phụ lục 01", page=1, bold=True)]
     section = build_sections(detect_headings(blocks, "docx"))[0]
     assert section.title == ""
@@ -606,7 +614,7 @@ def test_numbered_appendix_is_not_named_after_itself():
 
 
 def test_flattened_row_heading_line_carries_only_the_name():
-    """Dựng lại thì dòng tiêu đề chỉ mang tên mục, cả hàng xuống nội dung."""
+    """On rebuild the heading line carries only the name; the row moves to the body."""
     from docindex.layout import _heading_and_rest
 
     row = "STT: 3.1 | Nội dung: Đối tượng khách hàng | Cụ thể:"
@@ -614,17 +622,17 @@ def test_flattened_row_heading_line_carries_only_the_name():
                       path=["3.1.1"], full_heading=f"3.1.1 {row}")
     head, rest = _heading_and_rest(section)
     assert head == "3.1.1 Đối tượng khách hàng"
-    # cả hàng gốc vẫn còn đủ chữ ở phần nội dung — cột nào của bảng cũng giữ nhãn
+    # the original row keeps all its text in the body — every column keeps its label
     assert rest.startswith("STT: 3.1 | Nội dung: Đối tượng khách hàng")
 
 
 def test_full_heading_is_not_truncated_in_content(processed):
-    """Tiêu đề rút gọn chỉ dùng cho đường dẫn; nội dung phải giữ đủ chữ."""
+    """The shortened heading is for the path only; the body keeps every word."""
     for _path, _chunks, sections, _src, _st in processed:
         for section in sections:
-            # Mục đã gộp chỉ mục thì heading_str gom tên của nhiều tiêu đề, còn
-            # full_heading vẫn là dòng gốc của riêng nó — chữ của mục bị nuốt
-            # nằm ở thân bài, test_no_content_loss soát chỗ đó.
+            # For a section with merged numbers, heading_str collects several
+            # names while full_heading stays its own original line — the absorbed
+            # section's words live in the body, which test_no_content_loss checks.
             if section.full_heading and not section.is_merged:
                 assert len(section.full_heading) >= len(section.heading_str) - 1
 
@@ -637,7 +645,7 @@ def test_rows_to_markdown_drops_empty_columns():
 
 
 def test_long_table_row_keeps_all_cell_text():
-    """Hàng dài chuyển sang dạng 'cột: giá trị', không được mất chữ."""
+    """A long row becomes 'column: value' lines without losing any text."""
     long_cell = "giá trị rất dài " * 90
     md = "\n".join([
         "| Tiêu chí | Nội dung |",
@@ -651,26 +659,26 @@ def test_long_table_row_keeps_all_cell_text():
     for part in parts:
         rows = [r for r in part.split("\n") if r.strip().startswith("|")]
         widths = {r.count("|") for r in rows}
-        assert len(widths) <= 1, "bảng bị vỡ số cột"
+        assert len(widths) <= 1, "the table's column count broke"
 
 
 def test_toc_page_keeps_cover_content(processed):
-    """Bìa và mục lục chung một trang: chỉ được bỏ phần mục lục."""
+    """Cover and table of contents on one page: only the TOC part may be dropped."""
     for path, chunks, _sections, _src, _st in processed:
         if "Tràng An" not in os.path.basename(path):
             continue
         first_page = " ".join(c.raw_text for c in chunks if c.page == 1)
         assert "AN LỘC TÍCH LŨY THỊNH VƯỢNG" in first_page
-        assert "4474/BTC-QLBH" in first_page, "mất số công văn phê chuẩn ở trang bìa"
-        assert "....." not in first_page, "còn sót dòng mục lục"
+        assert "4474/BTC-QLBH" in first_page, "the approval document number was lost"
+        assert "....." not in first_page, "a table-of-contents line survived"
 
 
 def test_footnotes_are_dropped(processed):
-    """Cước chú không phải nội dung, càng không phải một mục trong cây chỉ mục.
+    """A footnote is not content, and certainly not a node in the outline.
 
-    "1 Theo địa giới hành chính cũ…" nằm dưới đường kẻ cuối trang là chú thích
-    cho một chỗ trong thân bài. Giữ lại thì nó trông y hệt đề mục "1." và bị
-    dựng thành một nhánh lớn ngang hàng với "1. Phạm vi điều chỉnh".
+    "1 Theo địa giới hành chính cũ…", sitting under the rule at the foot of the
+    page, annotates a point in the body. Kept, it looks exactly like heading
+    "1." and is built into a major branch level with "1. Phạm vi điều chỉnh".
     """
     for path, chunks, sections, _src, _st in processed:
         if "Xuân Thành" not in os.path.basename(path):
@@ -678,27 +686,27 @@ def test_footnotes_are_dropped(processed):
         body = " ".join(c.raw_text for c in chunks)
         assert "Theo địa giới hành chính cũ" not in body
         assert "ĐVKD chủ động thẩm định và chịu trách nhiệm" not in body
-        # Ba đề mục của tài liệu, không có nút nào sinh ra từ dòng cước chú.
-        # Hai mục đầu ngắn nên được gộp làm một — chỉ mục vẫn ghi đủ cả hai.
+        # The document's three headings, with no node born from a footnote line.
+        # The first two are short and merge into one — both numbers are kept.
         titles = [s.title for s in sections]
-        assert titles == ["Phần mở đầu",
+        assert titles == [PREAMBLE_TITLE,
                           "Phạm vi điều chỉnh và đối tượng áp dụng + Giải thích từ ngữ",
                           "Nội dung sản phẩm"]
         assert [s.number for s in sections] == ["", "1 + 2", "3"]
-        # dấu tham chiếu ("…từng thời kỳ⁶") không được dính vào chữ
+        # a reference mark ("…từng thời kỳ⁶") must not stick to the word
         assert "thời kỳ6" not in body and "thời kỳ4" not in body
         assert "chuyển nợ về nhóm 1 thì" in body
         break
     else:
-        pytest.fail("thiếu file mẫu Xuân Thành")
+        pytest.fail("the Xuân Thành sample file is missing")
 
 
 def _glyph_line(pieces, size=11.0, tracking=0.0):
-    """Dựng một dòng kiểu `rawdict`: mỗi từ một cụm glyph, dính sát nhau.
+    """Build a `rawdict`-style line: one cluster of glyphs per word, set flush.
 
-    `tracking` là bề rộng của glyph dấu cách chèn giữa từng chữ cái — công cụ
-    làm phẳng PDF đặt nó gần bằng 0 nên trên giấy không thấy, còn dấu cách thật
-    giữa hai từ thì rộng 0.25 lần cỡ chữ như mọi font chữ có chân.
+    `tracking` is the width of the space glyph inserted between letters — a PDF
+    flattening tool sets it to nearly zero, so it is invisible on paper, while a
+    real space between words is 0.25 of the font size, as in any serif face.
     """
     chars = []
     x = 0.0
@@ -719,11 +727,11 @@ def _glyph_line(pieces, size=11.0, tracking=0.0):
 
 
 def test_ghost_spaces_between_letters_are_dropped():
-    """Dấu cách rộng bằng 0 giữa từng chữ cái không được thành dấu cách thật.
+    """A zero-width space between letters must not become a real space.
 
-    File PDF đã "làm phẳng" đặt riêng vị trí cho mỗi glyph và nhét giữa hai chữ
-    cái một dấu cách gần như không có bề rộng. Đọc thẳng ra thì cả câu vỡ thành
-    "B á n , x á c" — chunk, tokenizer và bản dựng lại đều hỏng theo.
+    A "flattened" PDF positions every glyph individually and inserts a space of
+    almost no width between letters. Read straight out, the sentence shatters
+    into "B á n , x á c" — chunks, tokenizer and rebuild all break with it.
     """
     from docindex.extract_pdf import _rebuild_line
 
@@ -733,17 +741,18 @@ def test_ghost_spaces_between_letters_are_dropped():
 
 
 def test_real_spaces_survive_the_ghost_space_filter():
-    """Dấu cách thật vẫn phải là dấu cách — kể cả khi nó khép lại một span.
+    """A real space stays a space — even when it closes out a span.
 
-    Chữ có dấu thường lấy glyph từ font khác nên PyMuPDF cắt dòng thành nhiều
-    span, và dấu cách hay rơi đúng vào cuối một span ("QUY " | "ĐỊNH"). Đo
-    khoảng hở trong phạm vi từng span thì hai từ đó dính liền nhau.
+    Accented letters usually take their glyphs from a different font, so PyMuPDF
+    cuts the line into several spans and a space often lands at the end of one
+    ("QUY " | "ĐỊNH"). Measure the gap within a single span and the two words
+    run together.
     """
     from docindex.extract_pdf import _rebuild_line
 
     line = _glyph_line(["QUY", "ĐỊNH", "NGÂN"])
     chars = line["spans"][0]["chars"]
-    # cắt ngay trước "Đ": dấu cách đứng trước nó khép lại span thứ nhất
+    # cut right before "Đ": the space ahead of it closes the first span
     cut = next(i for i, c in enumerate(chars) if c["c"] == "Đ")
     line["spans"] = [{"size": 11.0, "chars": chars[:cut]},
                      {"size": 11.0, "chars": chars[cut:]}]
@@ -752,7 +761,7 @@ def test_real_spaces_survive_the_ghost_space_filter():
 
 
 def test_no_letter_spaced_runs_survive(processed):
-    """Không chunk nào còn chuỗi chữ cái rời rạc kiểu "B á n , x á c n h ậ n"."""
+    """No chunk still holds a letter-spaced run like "B á n , x á c n h ậ n"."""
     spaced = re.compile(r"(?:\w ){6,}\w")
     for path, chunks, _sections, _src, _st in processed:
         for chunk in chunks:
@@ -761,11 +770,11 @@ def test_no_letter_spaced_runs_survive(processed):
 
 
 def test_flattened_prose_is_not_sliced_into_a_table(processed):
-    """Đoạn văn xuôi không được đọc thành bảng.
+    """Prose must not be read as a table.
 
-    Trang "Giải thích từ ngữ" của bản đã làm phẳng không có lấy một cái bảng —
-    chỉ là danh sách định nghĩa đánh số. Đoán khung bảng theo khoảng trắng thì
-    nó bị xẻ dọc thành mười cột, chữ đứt ngang từ nằm rải khắp các ô.
+    The "Giải thích từ ngữ" page of the flattened file holds no table at all —
+    only a numbered list of definitions. Guess the table frame from whitespace
+    and it is sliced lengthwise into ten columns, with words broken across cells.
     """
     for path, chunks, sections, _src, _st in processed:
         if "bán ngoại tệ tiền mặt_flattened" not in os.path.basename(path):
@@ -778,26 +787,26 @@ def test_flattened_prose_is_not_sliced_into_a_table(processed):
                 "nhân mang theo khi xuất cảnh") in body
         break
     else:
-        pytest.fail("thiếu file mẫu đã làm phẳng")
+        pytest.fail("the flattened sample file is missing")
 
 
 def test_footnote_zone_leaves_real_content_alone(processed):
-    """Chỉ cắt chữ nhỏ ở đáy trang — nội dung cỡ chữ thường phải còn nguyên."""
+    """Only small text at the foot of the page is cut — body-size content stays."""
     for path, chunks, _sections, _src, _st in processed:
         if "Xuân Thành" not in os.path.basename(path):
             continue
         body = " ".join(c.raw_text for c in chunks)
-        # dòng cuối cùng của phần thân trên trang có cước chú
+        # the last body line on the page that carries a footnote
         assert "không quá 70 tuổi tại thời điểm kết thúc khoản vay" in body
         assert "Các giấy tờ khác có giá trị tương đương" in body
         break
 
 
 def test_no_content_loss(processed):
-    """Chốt chặn chống mất chữ: mọi từ trong tài liệu phải còn trong chunk.
+    """The backstop against text loss: every word in the document reaches a chunk.
 
-    Ngoại trừ dòng mục lục, chân trang lặp lại và cước chú — ba loại nhiễu bị
-    loại có chủ đích. Ngưỡng 95% để chừa chỗ cho phần nhiễu đó.
+    Except table-of-contents lines, repeated footers and footnotes — three kinds
+    of noise dropped on purpose. The 95% threshold leaves room for those.
     """
     import re
     from collections import Counter
@@ -813,19 +822,20 @@ def test_no_content_loss(processed):
         return re.findall(r"\w+", clean_text(s).lower())
 
     def pdf_lines(path):
-        """Chữ trong PDF, đã bỏ khối cước chú cuối trang và dòng đầu trang lặp.
+        """PDF text, minus the footnote block and the repeated header lines.
 
-        Cước chú và đầu/chân trang bị loại có chủ đích nên đếm chúng vào phần
-        "chữ phải giữ" sẽ báo động giả. Khoanh vùng lại ở đây theo đúng *định
-        nghĩa* của chúng — mạch chữ nhỏ liền đáy trang, dòng nằm sát mép trên
-        và lặp gần như mọi trang — chứ không gọi vào code đang được kiểm tra,
-        để test vẫn bắt được mọi chỗ mất chữ khác.
+        Footnotes and headers/footers are dropped on purpose, so counting them as
+        text-that-must-survive would raise false alarms. They are located here
+        from their own *definition* — an unbroken run of small text at the foot
+        of the page, and lines near the top edge repeating on nearly every page —
+        rather than by calling into the code under test, so the check still
+        catches every other kind of text loss.
 
-        Bản gốc đọc qua `_page_dict` chứ không phải `get_text("dict")`: file đã
-        làm phẳng chứa dấu cách giả giữa từng chữ cái, nên bản thô cho ra "b",
-        "á", "n" là ba "từ" riêng. Lấy chuỗi đó làm mốc thì mọi câu được ghép
-        lại đúng chính tả đều bị tính là mất chữ. Đây chỉ là khâu đọc glyph,
-        còn việc khoanh vùng nhiễu ở dưới vẫn tự làm lấy.
+        The source is read through `_page_dict` rather than `get_text("dict")`:
+        a flattened file carries ghost spaces between letters, so the raw text
+        yields "b", "á", "n" as three separate "words". Use that as the baseline
+        and every correctly reassembled sentence counts as lost text. Only the
+        glyph reading is borrowed; the noise detection below is done here.
         """
         doc = fitz.open(path)
         sizes = Counter()
@@ -885,8 +895,8 @@ def test_no_content_loss(processed):
         for line in lines:
             if dot.search(line):
                 continue
-            # So khớp trên bản đã quy ký hiệu: "𝐋𝟏" của Equation Editor và "L1"
-            # là cùng một chữ, khác nhau ở cách mã hoá chứ không phải mất chữ.
+            # Compare after symbol folding: Equation Editor's "𝐋𝟏" and "L1" are
+            # the same text, differing in encoding rather than being lost.
             src.update(words(normalize_symbols(line)))
         got = Counter()
         for chunk in chunks:
@@ -896,22 +906,22 @@ def test_no_content_loss(processed):
         missing = sum((src - got).values())
         kept = (total - missing) / total if total else 1
         assert kept >= 0.95, (
-            f"{os.path.basename(path)}: chỉ giữ {kept:.1%} số từ, "
-            f"thiếu {missing}/{total}"
+            f"{os.path.basename(path)}: only {kept:.1%} of words kept, "
+            f"{missing}/{total} missing"
         )
 
 
-# --- xuất bản tài liệu đã làm sạch ---------------------------------------
+# --- writing the cleaned document ----------------------------------------
 
 @pytest.fixture(scope="module")
 def cleaned(tmp_path_factory):
-    """Làm sạch toàn bộ tài liệu thật một lần, dùng chung cho các test dưới."""
+    """Clean the whole real corpus once, shared by the tests below."""
     from docindex.export import clean_document, out_dir_for
 
     out = tmp_path_factory.mktemp("cleaned")
     results = []
     for path in _docs():
-        # giữ nguyên cây thư mục: hai thư mục con có file trùng tên
+        # mirror the folder tree: two subfolders hold files with the same name
         dst_dir = out_dir_for(path, TEST_DIR, str(out))
         os.makedirs(dst_dir, exist_ok=True)
         dst, stats = clean_document(path, dst_dir)
@@ -920,7 +930,7 @@ def cleaned(tmp_path_factory):
 
 
 def test_output_marks_the_file_name_as_formalized(cleaned):
-    """Tên file kết quả giữ nguyên tên gốc kèm hậu tố `_formalized`."""
+    """The output name keeps the original name plus the `_formalized` suffix."""
     from docindex.export import FORMALIZED_SUFFIX
 
     for src, dst, _stats in cleaned:
@@ -929,7 +939,7 @@ def test_output_marks_the_file_name_as_formalized(cleaned):
 
 
 def test_output_does_not_repeat_the_suffix(tmp_path):
-    """Chạy lại trên bản đã chuẩn hóa thì hậu tố không nhân đôi."""
+    """Re-running on an already-normalised file does not double the suffix."""
     from docindex.export import FORMALIZED_SUFFIX, out_path
 
     src = os.path.join(str(tmp_path), f"quy-dinh{FORMALIZED_SUFFIX}.pdf")
@@ -938,7 +948,7 @@ def test_output_does_not_repeat_the_suffix(tmp_path):
 
 
 def test_output_refuses_to_overwrite_the_source(tmp_path):
-    """Hậu tố không nhân đôi, nên bản đã chuẩn hóa vẫn có thể tự ghi đè."""
+    """The suffix never doubles, so a normalised file could overwrite itself."""
     import fitz
 
     from docindex.export import FORMALIZED_SUFFIX, clean_document, out_path
@@ -948,9 +958,9 @@ def test_output_refuses_to_overwrite_the_source(tmp_path):
     doc.new_page()
     doc.save(src)
     doc.close()
-    with pytest.raises(ValueError, match="trùng file gốc"):
+    with pytest.raises(ValueError, match="is the source file"):
         clean_document(src, str(tmp_path))
-    with pytest.raises(ValueError, match="trùng file gốc"):
+    with pytest.raises(ValueError, match="is the source file"):
         out_path(src, str(tmp_path), out_format="same")
 
 
@@ -961,7 +971,7 @@ def test_cleaned_output_keeps_source_format(cleaned):
 
 
 def test_cleaned_pdf_keeps_content_figures(cleaned):
-    """Hình minh hoạ phải nằm lại trong file, không bị gỡ cùng logo."""
+    """Figures stay in the file; they are not stripped along with the logos."""
     import fitz
 
     checked = 0
@@ -979,14 +989,14 @@ def test_cleaned_pdf_keeps_content_figures(cleaned):
                     drawn += 1
         doc.close()
         assert drawn >= stats["figures_kept"], (
-            f"{os.path.basename(dst)}: giữ {stats['figures_kept']} hình nhưng "
-            f"chỉ còn {drawn} ảnh đủ lớn trong file"
+            f"{os.path.basename(dst)}: {stats['figures_kept']} figures kept but "
+            f"only {drawn} images large enough remain in the file"
         )
-    assert checked, "không có PDF nào chứa hình để kiểm tra"
+    assert checked, "no PDF with figures available to check"
 
 
 def test_cleaned_pdf_drops_repeated_boilerplate(cleaned):
-    """Chân trang lặp và số trang phải biến mất khỏi bản sạch."""
+    """Repeated footers and page numbers must vanish from the cleaned file."""
     import re
 
     import fitz
@@ -999,18 +1009,18 @@ def test_cleaned_pdf_drops_repeated_boilerplate(cleaned):
         for page in doc:
             for line in page.get_text("text").split("\n"):
                 assert not page_num.match(line.strip()), (
-                    f"{os.path.basename(dst)}: còn sót số trang '{line.strip()}'"
+                    f"{os.path.basename(dst)}: page number '{line.strip()}' survived"
                 )
         doc.close()
 
 
 def test_cleaned_pdf_is_not_bigger_than_source(cleaned):
-    """Ghi lại PDF không được làm phình file (từng phồng gần gấp đôi)."""
+    """Rewriting the PDF must not inflate it (it once nearly doubled)."""
     for src, dst, _stats in cleaned:
         if not src.lower().endswith(".pdf"):
             continue
         assert os.path.getsize(dst) <= os.path.getsize(src) * 1.05, (
-            f"{os.path.basename(dst)} phình to hơn bản gốc"
+            f"{os.path.basename(dst)} grew larger than the original"
         )
 
 
@@ -1031,10 +1041,10 @@ def test_cleaned_docx_keeps_body_and_clears_headers(cleaned):
 
 
 def test_faint_watermark_is_not_a_content_figure():
-    """Hoa văn chìm to bằng nửa trang vẫn phải bị xếp là nhiễu.
+    """A watermark half a page wide is still classified as noise.
 
-    Nó lọt mọi ngưỡng kích thước và không lặp lại trang nào, nên dấu hiệu duy
-    nhất còn lại là nó không có lấy một nét đậm nào.
+    It clears every size threshold and repeats on no page, so the only cue left
+    is that it carries no dark ink at all.
     """
     import fitz
 
@@ -1047,26 +1057,27 @@ def test_faint_watermark_is_not_a_content_figure():
         checked += 1
         with fitz.open(path) as doc:
             found = [i for items in collect_pdf_images(doc).values() for i in items
-                     if "hoa văn chìm" in i.reason]
-            assert found, "không nhận ra hoa văn chìm ở trang 3"
+                     if "watermark" in i.reason]
+            assert found, "the watermark on page 3 was not recognised"
             assert all(i.kind == "logo" for i in found)
-            # Ảnh còn lại ở trang 3 phải bị gỡ vì đúng lý do của nó. Trước đây
-            # chỗ này đòi trang 3 giữ được một hình nội dung, nhưng ảnh ấy là
-            # khung bo góc màu đỏ vẽ dưới một đoạn văn — 452 ký tự chữ sống của
-            # trang nằm đè lên nó — nên nó không phải hình.
+            # The other image on page 3 must be dropped for its own reason. This
+            # check once demanded that page 3 keep a content figure, but that
+            # image is a rounded red frame drawn under a paragraph — 452 live
+            # characters of the page sit on top of it — so it is not a figure.
             for img in collect_pdf_images(doc).get(3, []):
-                assert img.kind != "figure", f"{img.reason} không phải hình nội dung"
+                assert img.kind != "figure", f"{img.reason} is not a content figure"
     if not checked:
-        pytest.skip("thiếu file mẫu Trọn Đời")
+        pytest.skip("the Trọn Đời sample file is missing")
 
 
 def test_decorative_frame_is_not_a_content_figure():
-    """Khung bo góc vẽ dưới chữ là trang trí, còn sơ đồ thật phải sống sót.
+    """A frame drawn under the text is decoration; real diagrams must survive.
 
-    Phép đo mực không tách được hai thứ này: khung chỉ có mấy nét đỏ trên nền
-    trong suốt nên gần như 100% số điểm không phải nền giấy đều là nét đậm, nó
-    chấm 0.67 ngang với sơ đồ dày đặc nhất. Cái tách được là chữ sống của trang
-    nằm đè lên khung, còn nhãn của sơ đồ thì nằm sẵn trong file ảnh.
+    The ink measure cannot separate the two: a frame is a few red strokes on a
+    transparent ground, so nearly 100% of its non-paper pixels are dark ink and
+    it scores 0.67, level with the densest diagram. What does separate them is
+    the page's live text sitting on the frame, while a diagram's labels live
+    inside the image file itself.
     """
     import fitz
 
@@ -1082,24 +1093,25 @@ def test_decorative_frame_is_not_a_content_figure():
         with fitz.open(path) as doc:
             for items in collect_pdf_images(doc).values():
                 for img in items:
-                    if "khung trang trí" in img.reason:
+                    if "decorative frame" in img.reason:
                         frames += 1
                         assert img.kind == "logo"
                     if img.kind == "figure":
                         diagrams += 1
     if not frames:
-        pytest.skip("thiếu file mẫu Trọn Đời / Hưng Thịnh")
-    # Sơ đồ "Tài khoản hợp đồng" của bản Hưng Thịnh: nhãn nằm trong ảnh, không
-    # có chữ sống nào đè lên, nên nó không được rơi vào luật khung trang trí.
-    assert diagrams, "gỡ sạch cả sơ đồ nội dung"
+        pytest.skip("the Trọn Đời / Hưng Thịnh sample files are missing")
+    # The "Tài khoản hợp đồng" diagram in Hưng Thịnh: its labels are inside the
+    # image with no live text on top, so the decorative-frame rule must miss it.
+    assert diagrams, "the content diagrams were stripped too"
 
 
 def test_the_ink_threshold_sits_in_a_real_gap():
-    """Ngưỡng mực phải nằm giữa một khoảng trống rộng, không sát mép ai cả.
+    """The ink threshold must sit inside a wide gap, close to neither side.
 
-    Chỉ cần một hình nội dung nhạt màu rơi sát ngưỡng là lần đổi số tiếp theo sẽ
-    gỡ mất nó mà không ai biết. Đo trên bộ tài liệu thật: hoa văn ≤ 0.02, hình
-    nội dung ≥ 0.17 — ngưỡng 0.05 cách cả hai bên ít nhất ba lần.
+    One pale content figure landing near the threshold and the next tweak to the
+    number would silently drop it. Measured on the real corpus: watermarks
+    <= 0.02, content figures >= 0.17 — the 0.05 threshold is at least 3x from
+    both.
     """
     import fitz
 
@@ -1117,19 +1129,19 @@ def test_the_ink_threshold_sits_in_a_real_gap():
                 for img in items:
                     if img.kind == "figure":
                         solid.append(dark_ink_ratio(page, img.bbox))
-                    elif "hoa văn chìm" in img.reason:
+                    elif "watermark" in img.reason:
                         faint.append(dark_ink_ratio(page, img.bbox))
-    assert solid, "không có hình nội dung nào để đối chiếu"
+    assert solid, "no content figures available for comparison"
     assert min(solid) > WATERMARK_INK_RATIO * 3, (
-        f"hình nội dung nhạt nhất chỉ có {min(solid):.3f} mực, sát ngưỡng"
+        f"the palest content figure has only {min(solid):.3f} ink, near the threshold"
     )
     if faint:
         assert max(faint) < WATERMARK_INK_RATIO / 2, (
-            f"hoa văn đậm nhất đã lên tới {max(faint):.3f} mực, sát ngưỡng"
+            f"the darkest watermark reaches {max(faint):.3f} ink, near the threshold"
         )
 
 
-# --- chọn riêng từng thứ cần gỡ -------------------------------------------
+# --- choosing what to strip, item by item ---------------------------------
 
 ONLY_IMAGES = dict(drop_logo=True, drop_cover=True,
                    drop_header_footer=False, drop_toc=False)
@@ -1137,7 +1149,7 @@ ONLY_IMAGES = dict(drop_logo=True, drop_cover=True,
 
 @pytest.fixture(scope="module")
 def cleaned_images_only(tmp_path_factory):
-    """Mức mặc định của giao diện: chỉ gỡ logo và ảnh bìa, chữ để nguyên."""
+    """The GUI's default level: strip only logos and cover art, leave text alone."""
     from docindex.export import CleanOptions, clean_document, out_dir_for
 
     out = tmp_path_factory.mktemp("images-only")
@@ -1151,10 +1163,10 @@ def cleaned_images_only(tmp_path_factory):
 
 
 def test_keeping_text_leaves_every_character_in_place(cleaned_images_only):
-    """Tắt gỡ chữ thì bản sạch phải còn nguyên từng ký tự của bản gốc.
+    """With text removal off, the cleaned file keeps every character of the source.
 
-    Đây là điều người dùng trông đợi khi chỉ tick gỡ ảnh: file nhẹ đi nhưng mở
-    ra vẫn đúng từng trang, từng dòng như tài liệu gốc.
+    That is what a user expects when only the image boxes are ticked: a lighter
+    file that still opens page for page, line for line, like the original.
     """
     import fitz
 
@@ -1169,23 +1181,23 @@ def test_keeping_text_leaves_every_character_in_place(cleaned_images_only):
             assert after.page_count == before.page_count
             for old, new in zip(before, after):
                 assert new.get_text("text") == old.get_text("text"), (
-                    f"{os.path.basename(dst)} trang {new.number + 1}: chữ bị đổi"
+                    f"{os.path.basename(dst)} page {new.number + 1}: the text changed"
                 )
-    assert checked, "không có PDF nào để kiểm tra"
+    assert checked, "no PDF available to check"
 
 
 def test_keeping_text_still_drops_the_logos(cleaned_images_only, cleaned):
-    """Bỏ gỡ chữ không được làm mất luôn phần gỡ ảnh."""
+    """Turning text removal off must not disable image removal as well."""
     full = {src: stats for src, _dst, stats in cleaned}
     dropped = 0
     for src, _dst, stats in cleaned_images_only:
         assert stats["images_removed"] == full[src]["images_removed"]
         dropped += stats["images_removed"]
-    assert dropped, "không tài liệu nào có logo để gỡ"
+    assert dropped, "no document had a logo to strip"
 
 
 def test_keeping_images_leaves_them_in_the_file(tmp_path):
-    """Bỏ tick cả hai ô ảnh thì không ảnh nào bị gỡ."""
+    """With both image boxes unticked, no image is stripped."""
     from docindex.export import CleanOptions, clean_document, out_dir_for
 
     opts = CleanOptions(drop_logo=False, drop_cover=False,
@@ -1201,10 +1213,10 @@ def test_keeping_images_leaves_them_in_the_file(tmp_path):
 
 
 def test_cleaned_docx_can_keep_its_header_text(tmp_path):
-    """Gỡ logo trong header nhưng chữ ở header vẫn còn.
+    """Strip the logo from the header while the header text survives.
 
-    Logo công ty gần như luôn nằm trong header, nên "chỉ gỡ logo" bắt buộc phải
-    đụng vào header mà không được cuốn theo dòng chữ ở đó.
+    The company logo is almost always in the header, so "logos only" has to
+    touch the header without taking the text there along with it.
     """
     import docx
 
@@ -1224,7 +1236,7 @@ def test_cleaned_docx_can_keep_its_header_text(tmp_path):
     assert "Thân bài giữ nguyên." in "".join(p.text for p in after.paragraphs)
 
 
-# --- dựng lại bố cục: mỗi mục một trang -----------------------------------
+# --- rebuilt layout: one page per section ---------------------------------
 
 @pytest.fixture(scope="module")
 def laid_out(processed):
@@ -1236,7 +1248,7 @@ def laid_out(processed):
 
 @pytest.fixture(scope="module")
 def laid_out_per_section(processed):
-    """Bố cục lối cũ: mỗi mục một trang riêng, mỗi trang gọn trong trần token."""
+    """The older layout: one page per section, each page within the token ceiling."""
     from docindex.layout import build_pages
 
     return [(path, build_pages(sections, page_per_section=True), sections)
@@ -1244,10 +1256,10 @@ def laid_out_per_section(processed):
 
 
 def test_page_belongs_to_exactly_one_section(laid_out_per_section):
-    """Ràng buộc chính của bố cục: không trang nào chứa nội dung của hai mục.
+    """The layout's core constraint: no page holds content from two sections.
 
-    Trang chỉ được mang tiêu đề của chính mục đó, hoặc của mục cha đứng trên
-    nó — mục cha chỉ có mỗi dòng tiêu đề nên không có nội dung để lẫn vào.
+    A page may carry its own section's heading, or an ancestor's — an ancestor
+    holds nothing but its heading line, so there is no content to mix in.
     """
     from docindex.layout import _heading_and_rest
 
@@ -1268,24 +1280,24 @@ def test_page_belongs_to_exactly_one_section(laid_out_per_section):
                     continue
                 name = item.text.removesuffix(" (tiếp)")
                 assert name in allowed, (
-                    f"{os.path.basename(path)}: tiêu đề '{name}' lạc vào trang "
-                    f"của mục {page.section.path_str}")
+                    f"{os.path.basename(path)}: heading '{name}' strayed onto the "
+                    f"page of section {page.section.path_str}")
 
 
 def test_section_content_stays_together(laid_out):
-    """Các phần của cùng một mục phải nằm liền nhau, không bị mục khác chen vào."""
+    """The parts of one section stay adjacent, with no other section between them."""
     for path, pages, _sections in laid_out:
         seen: list[str] = []
         for page in pages:
             key = page.section.path_str
             if not seen or seen[-1] != key:
                 assert key not in seen, (
-                    f"{os.path.basename(path)}: mục {key} bị tách rời nhau")
+                    f"{os.path.basename(path)}: section {key} was split apart")
                 seen.append(key)
 
 
 def test_heading_size_decreases_by_level():
-    """1. to nhất, 1.1 nhỏ hơn, 1.1.1 nhỏ nhất — và nội dung nhỏ hơn mọi tiêu đề."""
+    """1. largest, 1.1 smaller, 1.1.1 smallest — and body smaller than all of them."""
     from docindex.layout import BODY_PT, HEADING_PT, heading_pt
 
     sizes = [heading_pt(level) for level in range(1, len(HEADING_PT) + 2)]
@@ -1303,14 +1315,15 @@ def test_heading_is_on_its_own_line(laid_out):
 
 
 def test_long_section_is_split_evenly(laid_out_per_section):
-    """Mục dài bị cắt ra thì các phần phải đầy xấp xỉ nhau, không phần nào tràn.
+    """A long section splits into roughly equal parts, none of them overflowing.
 
-    Trang bị chặn bởi hai trần: sức chứa của giấy (dòng) và trần token của hệ
-    RAG. Chỗ cắt do trần nào chạm trước quyết định, nên chỉ đòi cân bằng ở
-    thước đo đang chặn — mật độ chữ trên dòng thay đổi nên thước còn lại lệch
-    là chuyện bình thường. Bảng và hình không cắt nhỏ hơn được, nên phần nhẹ
-    nhất chỉ có thể thấp hơn mức chia đều đúng bằng khối lớn nhất; lệch hơn
-    ngần ấy nghĩa là thuật toán đang đổ đầy lần lượt thay vì chia đều.
+    A page is bounded twice: by the paper's capacity (lines) and by the RAG
+    token ceiling. Whichever binds first decides the split, so balance is only
+    demanded on the binding measure — text density per line varies, so the other
+    measure being uneven is normal. Tables and figures cannot be split further,
+    so the lightest part can fall below an even share by at most the largest
+    block; more than that means the algorithm is filling greedily rather than
+    dividing evenly.
     """
     from docindex.layout import LINES_PER_PAGE
 
@@ -1330,20 +1343,20 @@ def test_long_section_is_split_evenly(laid_out_per_section):
             lines = [p.lines for p in parts]
             tokens = [p.tokens for p in parts]
             assert max(lines) <= LINES_PER_PAGE, (
-                f"{os.path.basename(path)} {key}: trang tràn {lines} dòng")
+                f"{os.path.basename(path)} {key}: page overflows at {lines} lines")
             assert (balanced(lines, max(i.lines for p in parts for i in p.items))
                     or balanced(tokens, max(i.tokens for p in parts for i in p.items))), (
-                f"{os.path.basename(path)} {key}: các phần lệch nhau "
-                f"{lines} dòng / {tokens} token")
-    assert checked, "không có mục nào dài hơn một trang để kiểm tra"
+                f"{os.path.basename(path)} {key}: parts are uneven at "
+                f"{lines} lines / {tokens} tokens")
+    assert checked, "no section longer than one page available to check"
 
 
 def test_page_fits_the_rag_token_limit(laid_out_per_section):
-    """Mỗi trang phải gọn trong 512 token.
+    """Every page fits inside 512 tokens.
 
-    Hệ RAG đọc tài liệu theo cây DLA rồi cắt chunk ở trần 512 token. Trang nào
-    vượt trần sẽ bị nó cắt ở chỗ ngẫu nhiên giữa câu, nên phải cắt sẵn tại
-    ranh giới câu ngay từ khâu dựng lại.
+    The RAG stack reads the document by its DLA tree and chunks at a 512 token
+    ceiling. A page over that limit gets cut at an arbitrary point mid-sentence,
+    so the split is made at a sentence boundary during the rebuild instead.
     """
     from docindex.chunker import MAX_TOKENS
 
@@ -1351,17 +1364,17 @@ def test_page_fits_the_rag_token_limit(laid_out_per_section):
         for page in pages:
             biggest = max(i.tokens for i in page.items)
             if biggest > MAX_TOKENS:
-                continue        # một khối đơn lẻ không cắt nhỏ hơn được nữa
+                continue        # a single block that cannot be split any further
             assert page.tokens <= MAX_TOKENS, (
                 f"{os.path.basename(path)} {page.section.path_str}: "
-                f"trang {page.part_index} nặng {page.tokens} token")
+                f"page {page.part_index} weighs {page.tokens} tokens")
 
 
 def test_rebuilt_pdf_shows_headings_as_titles(processed, tmp_path_factory):
-    """Tiêu đề trong bản PDF phải in đậm và to hơn nội dung.
+    """Headings in the PDF are bold and larger than the body text.
 
-    Mô hình DLA nhìn trang giấy chứ không đọc cấu trúc file: cỡ chữ và độ đậm
-    là thứ quyết định nó gán nhãn `title` hay `list-item`.
+    A DLA model looks at the printed page, not the file structure: size and
+    weight are what decide whether it labels a line `title` or `list-item`.
     """
     import fitz
 
@@ -1385,31 +1398,32 @@ def test_rebuilt_pdf_shows_headings_as_titles(processed, tmp_path_factory):
     checked = 0
     for head in heads:
         probe = head.text.strip()[:12]
-        # Tên mục ngắn ("Phụ lục 01") còn xuất hiện trong câu dẫn chiếu giữa
-        # thân bài, nên phải xét *mọi* span khớp rồi lấy span to nhất — lấy
-        # span đầu tiên gặp được thì bắt nhầm dòng nội dung.
+        # A short section name ("Phụ lục 01") also appears in cross-references in
+        # the body, so *every* matching span is considered and the largest taken —
+        # taking the first match would catch a body line instead.
         hits = [s for s in spans if probe and probe in s["text"]]
         if not hits:
-            continue                # tiêu đề bị ngắt dòng giữa chừng
+            continue                # the heading was wrapped mid-line
         hit = max(hits, key=lambda s: s["size"])
         checked += 1
         assert hit["size"] > BODY_PT * 1.1, (
-            f"tiêu đề '{probe}' chỉ {hit['size']}pt, không nổi hơn nội dung")
+            f"heading '{probe}' is only {hit['size']}pt, no larger than the body")
         bold = bool(hit["flags"] & 2 ** 4) or "bold" in hit["font"].lower()
-        assert bold, f"tiêu đề '{probe}' không in đậm ({hit['font']})"
-    assert checked >= len(heads) // 2, "không kiểm tra được tiêu đề nào trong bản PDF"
+        assert bold, f"heading '{probe}' is not bold ({hit['font']})"
+    assert checked >= len(heads) // 2, "no headings could be checked in the PDF"
 
 
 def test_rebuilt_document_invents_no_heading(laid_out):
-    """Mỗi dòng tiêu đề vẽ ra phải có thật trong tài liệu.
+    """Every heading line drawn must actually exist in the document.
 
-    Hệ RAG dựng cây chỉ mục từ chính các dòng tiêu đề nó nhìn thấy, nên một
-    dòng do tool bịa thêm ("Phần mở đầu") là một nhánh giả trong cây và một
-    title sai cho mọi chunk nằm dưới nó.
+    A RAG stack builds its outline from the heading lines it sees, so a line the
+    tool invented (the preamble label, say) is a phantom branch in the tree and
+    a wrong title on every chunk below it.
 
-    Ngoại lệ duy nhất là hậu tố "(tiếp)": mục dài hơn trần token buộc phải cắt
-    làm nhiều phần, và dòng mở lại mục ấy chính là chỗ hệ RAG bám vào để cắt.
-    Nó không bịa ra một mục mới — tên mục vẫn nguyên vẹn phía trước.
+    The one exception is the "(tiếp)" suffix: a section over the token ceiling
+    has to be split into parts, and the line reopening it is exactly where the
+    RAG stack makes the cut. It invents no new section — the name is intact in
+    front of it.
     """
     from docindex.layout import _heading_and_rest
     from docindex.models import document_title
@@ -1424,15 +1438,15 @@ def test_rebuilt_document_invents_no_heading(laid_out):
                 name = item.text[:-len(" (tiếp)")] if item.text.endswith(
                     " (tiếp)") else item.text
                 assert name in real, (
-                    f"{os.path.basename(path)}: tiêu đề '{item.text}' không "
-                    "có trong tài liệu gốc")
+                    f"{os.path.basename(path)}: heading '{item.text}' is not in "
+                    "the original document")
 
 
 def test_every_level_keeps_one_font_size(laid_out):
-    """Cùng một cấp phải luôn cùng một cỡ chữ, cấp sâu hơn không to hơn cấp cạn.
+    """One level, one font size, and no deeper level is larger than a shallower one.
 
-    DLA suy ra cấp của tiêu đề từ cỡ chữ. Cùng một cấp mà lúc to lúc nhỏ thì
-    cây chỉ mục nó dựng ra sẽ so le.
+    A DLA model infers heading level from font size. If one level is sometimes
+    large and sometimes small, the outline it builds comes out ragged.
     """
     sizes: dict[int, set[float]] = {}
     for _path, pages, _sections in laid_out:
@@ -1443,17 +1457,17 @@ def test_every_level_keeps_one_font_size(laid_out):
 
     assert sizes
     for level, values in sizes.items():
-        assert len(values) == 1, f"cấp {level} có nhiều cỡ chữ: {values}"
+        assert len(values) == 1, f"level {level} uses several font sizes: {values}"
     ordered = [next(iter(sizes[level])) for level in sorted(sizes)]
     assert ordered == sorted(ordered, reverse=True), ordered
 
 
 def test_headings_ask_word_to_keep_them_with_their_content(processed, tmp_path_factory):
-    """Tiêu đề trong .docx phải mang cờ keep_with_next.
+    """Headings in the .docx carry the keep_with_next flag.
 
-    Việc ngắt trang do Word quyết định, tool không chen vào. Thứ giữ cho tiêu
-    đề không đứng trơ trọi cuối trang là cờ này — thiếu nó thì tiêu đề và nội
-    dung của nó bị tách ra hai trang.
+    Word decides the page breaks and the tool does not interfere. This flag is
+    what keeps a heading from being stranded at the foot of a page — without it,
+    a heading and its content end up on two different pages.
     """
     import docx
     from docx.shared import Pt
@@ -1467,27 +1481,27 @@ def test_headings_ask_word_to_keep_them_with_their_content(processed, tmp_path_f
 
     heads = [p for p in docx.Document(dst).paragraphs
              if p.runs and p.runs[0].bold and p.runs[0].font.size > Pt(BODY_PT)]
-    assert heads, "không tìm thấy tiêu đề nào trong bản .docx"
+    assert heads, "no headings found in the .docx"
     for para in heads:
         assert para.paragraph_format.keep_with_next, (
-            f"tiêu đề '{para.text[:40]}' thiếu keep_with_next")
+            f"heading '{para.text[:40]}' is missing keep_with_next")
 
 
 def test_outline_stays_within_the_rag_depth_limit(processed):
-    """Hệ RAG đọc cây sâu tối đa 6 cấp."""
+    """The RAG stack reads an outline at most 6 levels deep."""
     from docindex.layout import MAX_TREE_DEPTH
 
     for path, _chunks, sections, _src, _st in processed:
         depth = max(s.level for s in sections)
         assert depth <= MAX_TREE_DEPTH, (
-            f"{os.path.basename(path)}: cây sâu {depth} cấp")
+            f"{os.path.basename(path)}: outline is {depth} levels deep")
 
 
 def test_rebuilt_pdf_leads_with_the_document_title(processed, tmp_path_factory):
-    """Trang đầu phải mở bằng tên tài liệu, in đậm và to nhất trang.
+    """Page one opens with the document title, bold and the largest on the page.
 
-    Hệ RAG lấy tiêu đề tài liệu làm gốc title của mọi chunk; thiếu nó thì mọi
-    chunk mất một cấp trên cùng.
+    A RAG stack uses the document title as the root of every chunk title;
+    without it, every chunk loses its topmost level.
     """
     import fitz
 
@@ -1511,12 +1525,12 @@ def test_rebuilt_pdf_leads_with_the_document_title(processed, tmp_path_factory):
 
 
 def test_rebuilt_pdf_uses_plain_spaces(processed, tmp_path_factory):
-    """Đọc lại bản PDF phải ra dấu cách thường, không phải U+00A0.
+    """Reading the PDF back yields ordinary spaces, not U+00A0.
 
-    Font TrueType nhúng vào PDF làm glyph dấu cách trỏ về U+00A0 trong bảng
-    ToUnicode. Trên giấy không thấy khác biệt gì, nhưng mọi công cụ trích xuất
-    sẽ trả về chuỗi không có lấy một dấu cách thường — tách từ, BM25 và
-    tokenizer phía RAG hỏng theo mà không báo lỗi.
+    A TrueType font embedded in a PDF makes the space glyph map to U+00A0 in the
+    ToUnicode table. Nothing looks different on paper, but every extraction tool
+    receives a string without a single ordinary space in it — word segmentation,
+    BM25 and the RAG tokenizer all break, and none of them report an error.
     """
     import fitz
 
@@ -1529,12 +1543,12 @@ def test_rebuilt_pdf_uses_plain_spaces(processed, tmp_path_factory):
     doc = fitz.open(dst)
     text = "".join(page.get_text("text") for page in doc)
     doc.close()
-    assert " " not in text, "dấu cách trong PDF vẫn là U+00A0"
-    assert text.count(" ") > 100, "không trích được dấu cách thường nào"
+    assert " " not in text, "spaces in the PDF are still U+00A0"
+    assert text.count(" ") > 100, "no ordinary spaces were extracted"
 
 
 def test_rebuilt_document_keeps_all_words(laid_out):
-    """Dựng lại bố cục không được làm rơi chữ nào của nội dung đã trích xuất."""
+    """Rebuilding the layout drops no word of the extracted content."""
     import re
     from collections import Counter
 
@@ -1549,7 +1563,7 @@ def test_rebuilt_document_keeps_all_words(laid_out):
                 src.update(words(section.heading_text))
             for block in section.blocks:
                 if block.kind == "figure":
-                    continue        # hình được thay bằng ảnh thật, không phải chữ
+                    continue        # figures become real images, not text
                 src.update(words(block.text))
         got = Counter()
         for page in pages:
@@ -1559,11 +1573,11 @@ def test_rebuilt_document_keeps_all_words(laid_out):
         missing = sum((src - got).values())
         total = sum(src.values())
         assert missing == 0, (
-            f"{os.path.basename(path)}: mất {missing}/{total} từ khi dựng lại")
+            f"{os.path.basename(path)}: {missing}/{total} words lost in the rebuild")
 
 
 def test_rebuild_writes_both_formats(processed, tmp_path_factory):
-    """Chọn được .docx hay .pdf; số trang báo cáo đúng bằng số trang file thật."""
+    """Either .docx or .pdf; the reported page count matches the real file."""
     import docx
     import fitz
     from docx.oxml.ns import qn
@@ -1574,35 +1588,35 @@ def test_rebuild_writes_both_formats(processed, tmp_path_factory):
     out = tmp_path_factory.mktemp("rebuilt")
     path, _chunks, sections, _src, _st = processed[0]
 
-    # Chế độ chảy liên tục: bộ ghi tự ngắt trang nên tài liệu không mang sẵn
-    # dấu ngắt trang nào; ép ngắt theo ước lượng của tool là nguồn gốc của
-    # những trang gần như trống.
+    # Continuous-flow mode: the renderer decides the page breaks, so the document
+    # carries none of its own; forcing breaks from the tool's estimate is what
+    # produced the nearly-empty pages.
     dst_docx, stats = rebuild_document(sections, path, str(out), out_format="docx")
     assert dst_docx.endswith(".docx") and stats["pages_out"] >= 1
     document = docx.Document(dst_docx)
     breaks = sum(1 for p in document.paragraphs for br in p._p.iter(qn("w:br"))
                  if br.get(qn("w:type")) == "page")
-    assert breaks == 0, "bản chảy liên tục không được chèn dấu ngắt trang"
+    assert breaks == 0, "the continuous-flow build must insert no page breaks"
 
     dst_pdf, stats = rebuild_document(sections, path, str(out), out_format="pdf")
     doc = fitz.open(dst_pdf)
     assert dst_pdf.endswith(".pdf") and stats["pages_out"] == doc.page_count
 
-    # Lối cũ mỗi mục một trang thì số dấu ngắt phải khớp số trang đã bố trí
+    # In one-page-per-section mode the break count matches the pages laid out
     per_section = len(build_pages(sections, page_per_section=True))
     dst2, stats2 = rebuild_document(sections, path, str(out), out_format="docx",
                                     suffix="_persection", page_per_section=True)
     breaks2 = sum(1 for p in docx.Document(dst2).paragraphs
                   for br in p._p.iter(qn("w:br")) if br.get(qn("w:type")) == "page")
     assert breaks2 == per_section - 1 and stats2["pages_out"] == per_section
-    # font phải nhúng đủ dấu tiếng Việt, không rơi thành ô vuông
+    # the font must carry the Vietnamese diacritics, not fall back to tofu boxes
     text = "".join(page.get_text("text") for page in doc)
     doc.close()
-    assert any(ch in text for ch in "ăâđêôơư"), "bản PDF mất dấu tiếng Việt"
+    assert any(ch in text for ch in "ăâđêôơư"), "the PDF lost its Vietnamese diacritics"
 
 
 def _docx_with_picture(tmp_path):
-    """Tạo một .docx có ảnh nhúng — bộ tài liệu thật không có file nào như vậy."""
+    """Build a .docx with an embedded image — the real corpus has no such file."""
     import docx
     import fitz
     from docx.shared import Pt as DocxPt
@@ -1621,7 +1635,7 @@ def _docx_with_picture(tmp_path):
 
 
 def test_docx_image_is_extracted_and_rebuilt(tmp_path):
-    """Hình trong .docx phải ra được file để nhúng lại vào bản dựng lại."""
+    """A figure in a .docx exports to a file so the rebuild can embed it again."""
     import docx
     import fitz
 
@@ -1633,38 +1647,38 @@ def test_docx_image_is_extracted_and_rebuilt(tmp_path):
     figure_dir = str(tmp_path / "figures")
     blocks, _source = extract(src, figure_dir=figure_dir, doc_id="t")
     figures = [b for b in blocks if b.kind == "figure"]
-    assert figures, "không nhận ra hình minh hoạ trong .docx"
-    assert os.path.isfile(figures[0].meta["file"]), "chưa tách được file ảnh"
+    assert figures, "no figure was recognised in the .docx"
+    assert os.path.isfile(figures[0].meta["file"]), "the image file was not extracted"
 
     sections = build_sections(detect_headings(blocks, "docx"))
     out = str(tmp_path / "out")
     dst, _stats = rebuild_document(sections, src, out, out_format="docx",
                                    figure_dir=figure_dir)
     parts = docx.Document(dst).part.package.image_parts
-    assert len(list(parts)) == 1, "ảnh không được nhúng vào bản .docx dựng lại"
+    assert len(list(parts)) == 1, "the image was not embedded in the rebuilt .docx"
 
     dst, _stats = rebuild_document(sections, src, out, out_format="pdf",
                                    figure_dir=figure_dir)
     doc = fitz.open(dst)
     embedded = sum(len(page.get_images()) for page in doc)
     doc.close()
-    assert embedded == 1, "ảnh không được nhúng vào bản .pdf dựng lại"
+    assert embedded == 1, "the image was not embedded in the rebuilt .pdf"
 
 
 def test_rebuilt_pdf_is_not_bloated_by_fonts(processed, tmp_path_factory):
-    """Nhúng nguyên font hệ thống từng làm file phồng lên vài MB."""
+    """Embedding a whole system font once inflated the file by several MB."""
     from docindex.export import rebuild_document
 
     out = tmp_path_factory.mktemp("rebuilt-size")
     path, _chunks, sections, _src, _st = processed[0]
     dst, _stats = rebuild_document(sections, path, str(out), out_format="pdf")
-    assert os.path.getsize(dst) < 1_500_000, "font chưa được rút gọn"
+    assert os.path.getsize(dst) < 1_500_000, "the font was not subset"
 
 
-# --- giao diện đồ hoạ -----------------------------------------------------
+# --- graphical interface --------------------------------------------------
 
 def test_outline_shows_the_tree_with_indentation(processed):
-    """Bản in cây chỉ mục phải thụt lề theo cấp và không chứa mục do tool đặt tên."""
+    """The printed outline indents by level and holds no tool-invented section."""
     from docindex.models import PREAMBLE_TITLE, document_title
     from docindex.report import format_outline, outline
 
@@ -1672,7 +1686,7 @@ def test_outline_shows_the_tree_with_indentation(processed):
     tree = format_outline(sections, document_title(path))
     lines = tree.split("\n")
 
-    assert lines[0].startswith("[tài liệu] ")
+    assert lines[0].startswith("[document] ")
     assert PREAMBLE_TITLE not in tree
     nodes = outline(sections)
     assert len(lines) == len(nodes) + 1
@@ -1681,7 +1695,7 @@ def test_outline_shows_the_tree_with_indentation(processed):
 
 
 def test_gui_options_cover_everything_the_worker_reads():
-    """Thiếu một khoá trong opts là giao diện chết giữa chừng lúc đang chạy."""
+    """A missing key in opts kills the GUI halfway through a run."""
     import inspect
 
     from docindex import gui
@@ -1689,11 +1703,11 @@ def test_gui_options_cover_everything_the_worker_reads():
     source = inspect.getsource(gui.App._work)
     used = set(re.findall(r"opts\[\"(\w+)\"\]", source))
     built = set(re.findall(r"\"(\w+)\":", inspect.getsource(gui.App.start)))
-    assert used <= built, f"opts thiếu khoá: {used - built}"
+    assert used <= built, f"opts is missing keys: {used - built}"
 
 
 def test_parse_drop_handles_paths_with_spaces():
-    """Đường dẫn có dấu cách được hệ điều hành bọc trong ngoặc nhọn."""
+    """The OS wraps paths containing spaces in braces."""
     from docindex.gui import parse_drop
 
     assert parse_drop("{C:/Máy tính/tài liệu a.pdf} C:/b.docx") == [
@@ -1701,32 +1715,32 @@ def test_parse_drop_handles_paths_with_spaces():
     ]
     assert parse_drop("C:/x.pdf") == ["C:/x.pdf"]
     assert parse_drop("") == []
-    # Windows gửi dấu \ và bọc từng file khi thả nhiều file cùng lúc
+    # Windows sends backslashes and braces each file when several are dropped
     assert parse_drop(r"{C:\Tài liệu\quy dinh.docx} {C:\a\b c.pdf}") == [
         r"C:\Tài liệu\quy dinh.docx", r"C:\a\b c.pdf",
     ]
 
 
 def test_gui_says_so_when_drag_and_drop_is_unavailable():
-    """Thiếu tkinterdnd2 thì phải nói thẳng, không mời thả suông.
+    """Without tkinterdnd2, say so plainly rather than inviting a pointless drop.
 
-    Vùng thả vẫn ghi "Thả tài liệu vào đây" trong khi thư viện chưa có thì
-    người dùng thả xong không thấy gì xảy ra và không biết vì sao.
+    If the drop area still reads "Drop documents here" while the library is
+    missing, the user drops a file, nothing happens, and there is no clue why.
     """
     import tkinter as tk
 
     from docindex import gui
 
     try:
-        root = tk.Tk()          # Tk thường: chắc chắn không kéo thả được
+        root = tk.Tk()          # plain Tk: drag and drop is definitely unavailable
     except tk.TclError:
-        pytest.skip("môi trường không mở được cửa sổ Tk")
+        pytest.skip("this environment cannot open a Tk window")
     try:
         app = gui.App(root)
         root.update()
         assert not app._enable_dnd()
-        assert "chưa dùng được" in app.drop_label["text"]
-        assert "Chọn file" in app.drop_label["text"]
+        assert "unavailable" in app.drop_label["text"]
+        assert "Choose files" in app.drop_label["text"]
         assert "tkinterdnd2" in app.log.get("1.0", "end")
     finally:
         root.destroy()
@@ -1739,27 +1753,27 @@ def test_expand_inputs_filters_and_walks_folders():
     assert from_folder and all(
         os.path.splitext(p)[1].lower() in {".pdf", ".docx"} for p in from_folder
     )
-    assert expand_inputs(["khong-ton-tai.txt"]) == []
+    assert expand_inputs(["does-not-exist.txt"]) == []
 
 
 def test_page_numbers_are_not_in_text(processed):
-    """Dòng kiểu '9/34' ở chân trang là nhiễu, phải bị loại sạch."""
+    """A footer line like '9/34' is noise and must be stripped entirely."""
     import re
     pat = re.compile(r"^\s*\d+\s*/\s*\d+\s*$")
     for _path, chunks, _sections, _src, _st in processed:
         for chunk in chunks:
             for line in chunk.raw_text.split("\n"):
-                assert not pat.match(line), f"{chunk.chunk_id}: còn sót '{line}'"
+                assert not pat.match(line), f"{chunk.chunk_id}: '{line}' survived"
 
 
-# --- chuẩn hoá ký hiệu đặc biệt -------------------------------------------
+# --- normalising special symbols ------------------------------------------
 
 def test_math_variables_become_plain_letters():
-    """Biến của Equation Editor phải hạ về chữ Latin thường.
+    """Equation Editor variables are lowered to plain Latin letters.
 
-    Công thức tính lãi được soạn bằng Equation Editor nên "Mi" thật ra nằm ở
-    khối Mathematical Alphanumeric Symbols. Hệ RAG không có font cho khối đó,
-    đọc ra thành "$Mi$" hoặc bỏ hẳn — chuẩn phải là "Mi".
+    Interest formulas are typed in Equation Editor, so "Mi" really lives in the
+    Mathematical Alphanumeric Symbols block. A RAG stack has no font for that
+    block and reads it as "$Mi$" or drops it — the correct result is "Mi".
     """
     assert normalize_symbols("𝐌𝐢") == "Mi"
     assert normalize_symbols("𝐋 = 𝐌 ∗𝐓 ∗𝐑") == "L = M *T *R"
@@ -1768,29 +1782,29 @@ def test_math_variables_become_plain_letters():
 
 
 def test_symbols_are_spelled_out_or_flattened():
-    """Ký hiệu toán và dấu câu kiểu chữ quy về chữ hoặc dấu ASCII."""
+    """Maths symbols and typographic punctuation fold to words or ASCII marks."""
     assert "Tổng" in normalize_symbols("∑")
     assert normalize_symbols("a ≤ b ≥ c ≠ d") == "a <= b >= c != d"
     assert normalize_symbols("5 × 3 ÷ 2 ± 1") == "5 x 3 / 2 +/- 1"
     assert normalize_symbols("“abc” – ‘x’") == "\"abc\" - 'x'"
-    # font Symbol của Word đẩy glyph vào vùng dùng riêng, giữ nguyên mã ASCII
+    # Word's Symbol font pushes glyphs into the PUA, keeping their ASCII codes
     assert normalize_symbols("a \uf02b b") == "a + b"
     assert normalize_symbols("\uf0b7 gạch đầu dòng") == "- gạch đầu dòng"
 
 
 def test_clean_text_keeps_ordinary_vietnamese_intact():
-    """Chuẩn hoá không được đụng tới chữ tiếng Việt hay dấu câu thường."""
+    """Normalisation leaves ordinary Vietnamese text and punctuation untouched."""
     src = "Điều 5.1: Lãi suất 6,5%/năm (áp dụng từ 01/2026) - xem mục 2.3."
     assert clean_text(src) == src
 
 
 def test_rebuilt_pdf_reads_back_every_character(tmp_path):
-    """Đọc lại bản PDF phải ra đúng ký tự đã ghi vào.
+    """Reading the PDF back yields exactly the characters that were written.
 
-    Bảng ToUnicode do MuPDF dựng trỏ nhầm vài glyph sang ký tự song trùng —
-    dấu gạch thành gạch nối mềm U+00AD, chấm phẩy thành dấu chấm hỏi Hy Lạp
-    U+037E. Trên giấy không thấy khác biệt, nhưng phía RAG nhận về một chuỗi
-    không còn dấu gạch hay chấm phẩy nào.
+    The ToUnicode table MuPDF builds maps a few glyphs to their twins — hyphen
+    to soft hyphen U+00AD, semicolon to the Greek question mark U+037E. Nothing
+    looks different on paper, but the RAG side receives a string with not one
+    hyphen or semicolon left in it.
     """
     import fitz
 
@@ -1805,38 +1819,39 @@ def test_rebuilt_pdf_reads_back_every_character(tmp_path):
     text = "".join(page.get_text("text") for page in doc)
     doc.close()
     for mark in ("-", ";", " "):
-        assert mark in text, f"đọc lại PDF không còn ký tự {mark!r}"
+        assert mark in text, f"reading the PDF back lost the {mark!r} character"
     for wrong in ("\u00ad", "\u037e", "\u00a0"):
-        assert wrong not in text, f"PDF đọc ra ký tự song trùng U+{ord(wrong):04X}"
+        assert wrong not in text, f"the PDF reads back the twin character U+{ord(wrong):04X}"
 
 
-# --- tiêu đề lớn không đánh số --------------------------------------------
+# --- unnumbered banner headings -------------------------------------------
 
 def test_two_big_titles_become_the_top_level(processed):
-    """Tài liệu có nhiều tiêu đề lớn thì chúng phải là cấp cao nhất của cây.
+    """When a document has several banner headings, they are the tree's top level.
 
-    "TỔNG QUAN VĂN BẢN QUY ĐỊNH" rồi "QUY ĐỊNH SẢN PHẨM…" chia tài liệu làm hai
-    phần lớn. Không nhận ra thì "1. TIÊU ĐỀ SẢN PHẨM" của phần đầu và "Điều 1"
-    của phần sau nằm ngang hàng nhau, và cây chỉ mục mất hẳn cấp trên cùng.
+    "TỔNG QUAN VĂN BẢN QUY ĐỊNH" followed by "QUY ĐỊNH SẢN PHẨM…" divides the
+    document into two major parts. Miss them and the first part's "1. TIÊU ĐỀ
+    SẢN PHẨM" sits level with the second part's "Điều 1", and the outline loses
+    its top level entirely.
     """
     for path, _chunks, sections, _src, _st in processed:
         if "rút gốc linh hoạt" not in os.path.basename(path):
             continue
         banners = [s for s in sections if s.is_banner]
-        assert len(banners) >= 2, "không nhận ra tiêu đề lớn nào"
-        assert all(s.level == 1 for s in banners), "tiêu đề lớn không ở cấp 1"
-        assert all(not s.number for s in banners), "tiêu đề lớn không đánh số"
+        assert len(banners) >= 2, "no banner heading was recognised"
+        assert all(s.level == 1 for s in banners), "banner headings are not at level 1"
+        assert all(not s.number for s in banners), "a banner heading carries a number"
         assert "TỔNG QUAN VĂN BẢN QUY ĐỊNH" in [s.title for s in banners]
-        # mọi mục có đánh số đều nằm dưới một tiêu đề lớn nào đó
+        # every numbered section sits under one banner heading or another
         numbered = [s for s in sections if s.number]
         assert numbered and all(s.level >= 2 for s in numbered)
         break
     else:
-        pytest.fail("thiếu file mẫu tiết kiệm rút gốc linh hoạt")
+        pytest.fail("the 'rút gốc linh hoạt' sample file is missing")
 
 
 def test_a_formula_line_is_not_taken_for_a_big_title():
-    """Dòng "L = M *T *R" cũng cỡ lớn và toàn chữ hoa, nhưng không phải tiêu đề."""
+    """"L = M *T *R" is also large and all caps, but it is not a heading."""
     from docindex.headings import _is_banner
 
     def block(text):
@@ -1846,40 +1861,41 @@ def test_a_formula_line_is_not_taken_for_a_big_title():
     assert not _is_banner(block("L = M *T *R"), 12.0)
     assert not _is_banner(block("12"), 12.0)
     assert _is_banner(block("TỔNG QUAN VĂN BẢN QUY ĐỊNH"), 12.0)
-    # cỡ chữ bằng nội dung thì không phải tiêu đề lớn
+    # at body font size it is not a banner heading
     assert not _is_banner(block("TỔNG QUAN VĂN BẢN"), 16.0)
 
 
-# --- gộp mục ngắn ----------------------------------------------------------
+# --- merging short sections -----------------------------------------------
 
 def test_merging_looks_both_ways(processed):
-    """Mục ngắn phải xét được cả mục trên lẫn mục dưới.
+    """A short section considers both the section above it and the one below.
 
-    Chỉ nhìn lên trên thì một mục ngắn nằm ngay sau một mục đồ sộ sẽ mắc kẹt
-    mãi mãi — "Điều 1" một trăm token đứng riêng chỉ vì phía trên nó là "MỤC
-    LỤC" tám trăm token, trong khi "Điều 2" ngay dưới còn thừa chỗ.
+    Looking only backwards leaves a short section stranded forever behind a huge
+    one — a hundred-token "Điều 1" standing alone only because an
+    eight-hundred-token "MỤC LỤC" precedes it, while "Điều 2" just below has
+    room to spare.
     """
     from docindex.headings import merge_short_sections
 
     for path, _chunks, sections, _src, _st in processed:
         if "rút gốc linh hoạt" not in os.path.basename(path):
             continue
-        assert [s for s in sections if s.is_merged], "không gộp được mục ngắn nào"
-        # chạy lại một lượt nữa không được gộp thêm gì: đã tới điểm dừng
+        assert [s for s in sections if s.is_merged], "no short section was merged"
+        # a second pass must merge nothing more: the fixed point has been reached
         again = merge_short_sections(sections, CFG.min_tokens, CFG.max_tokens)
-        assert len(again) == len(sections), "còn cặp mục ngắn chưa gộp hết"
+        assert len(again) == len(sections), "a mergeable pair of short sections is left"
         break
     else:
-        pytest.fail("thiếu file mẫu tiết kiệm rút gốc linh hoạt")
+        pytest.fail("the 'rút gốc linh hoạt' sample file is missing")
 
 
 def test_merged_section_does_not_repeat_its_own_name(laid_out):
-    """Mục đã gộp chỉ mục không được in lại tên của chính nó ngay dưới tiêu đề.
+    """A section with merged numbers must not reprint its own name below the heading.
 
-    Danh mục định nghĩa có *nội dung chính là tên mục* ("12 Doanh nghiệp cho
-    thuê lại lao động: Là doanh nghiệp…"). Gộp hai mục như vậy thì tên mục vừa
-    nằm trên dòng tiêu đề vừa mở đầu phần nội dung — đọc ra thành lặp nguyên
-    văn một lần nữa.
+    A glossary has *the section name as its content* ("12 Doanh nghiệp cho thuê
+    lại lao động: Là doanh nghiệp…"). Merge two such sections and the name sits
+    both on the heading line and at the start of the body — read back, it
+    repeats itself word for word.
     """
     from docindex.layout import _heading_and_rest
 
@@ -1890,17 +1906,17 @@ def test_merged_section_does_not_repeat_its_own_name(laid_out):
             _title, rest = _heading_and_rest(section)
             first = rest.split("\n")[0].strip()
             assert not first.startswith(section.own_title), (
-                f"'{section.own_title}' vừa là tiêu đề vừa là dòng nội dung đầu")
+                f"'{section.own_title}' is both the heading and the first body line")
 
 
-# --- tiêu đề đầy đủ --------------------------------------------------------
+# --- full-length headings -------------------------------------------------
 
 def test_heading_line_keeps_the_whole_name(laid_out):
-    """Dòng tiêu đề in ra lấy tên mục ở độ dài đầy đủ, không phải bản rút gọn.
+    """The printed heading takes the name at full length, not the shortened form.
 
-    Tên mục bị rút về 90 ký tự để tiền tố mục lục còn chỗ cho nội dung. Dùng
-    luôn bản rút gọn ấy làm dòng tiêu đề trên giấy thì "…làm nguyên" nằm trên
-    tiêu đề còn "liệu sản xuất" rơi xuống thành một đoạn nội dung cụt.
+    Names are trimmed to 90 characters so the outline prefix leaves room for
+    content. Use that trimmed form as the printed heading and "…làm nguyên" ends
+    up on the heading while "liệu sản xuất" drops down as a stunted paragraph.
     """
     from docindex.headings import MAX_TITLE_IN_HEADING, MAX_TITLE_IN_PATH
 
@@ -1909,36 +1925,36 @@ def test_heading_line_keeps_the_whole_name(laid_out):
         for section in sections:
             if section.is_preamble or not section.own_title:
                 continue
-            # chỉ được cắt bớt khi tên mục thật sự dài quá trần của dòng tiêu đề
+            # trimming is only allowed when the name truly exceeds the heading ceiling
             assert (not section.own_title.endswith("…")
                     or len(section.own_title) >= MAX_TITLE_IN_HEADING - 20), (
-                f"tên mục '{section.own_title}' bị cắt sớm")
+                f"section name '{section.own_title}' was trimmed too early")
             longer += len(section.own_title) > MAX_TITLE_IN_PATH
-    assert longer, "không tiêu đề nào dài quá trần của đường dẫn — mẫu không đủ"
+    assert longer, "no heading exceeds the path ceiling — the sample is too small"
 
 
 def test_long_heading_keeps_every_word(processed):
-    """Tiêu đề dài của văn bản pháp lý không được coi là câu văn mà bỏ đi."""
+    """A long heading in a legal text must not be dismissed as prose."""
     for path, _chunks, sections, _src, _st in processed:
         if "Ký quỹ" not in os.path.basename(path):
             continue
         target = [s for s in sections if s.number.startswith("15.10")]
-        assert target, "mất hẳn đề mục 15.10"
+        assert target, "heading 15.10 was lost entirely"
         assert "nguyên liệu sản xuất" in target[0].full_heading, (
-            f"tiêu đề 15.10 thiếu chữ: {target[0].full_heading!r}")
+            f"heading 15.10 is missing words: {target[0].full_heading!r}")
         break
     else:
-        pytest.fail("thiếu file mẫu tiền gửi Ký quỹ")
+        pytest.fail("the 'Ký quỹ' sample file is missing")
 
 
-# --- mục quá dài -----------------------------------------------------------
+# --- over-long sections ---------------------------------------------------
 
 def test_long_section_is_reopened_with_a_continuation_line(laid_out):
-    """Mục dài hơn trần token phải được cắt bằng dòng "(tiếp)".
+    """A section over the token ceiling is split with a "(tiếp)" line.
 
-    Hệ RAG cắt chunk theo cây chỉ mục chứ không theo trang, nên một mục bốn
-    nghìn token cho ra đúng một chunk bốn nghìn token và bị khâu embedding cắt
-    cụt. Dòng "(tiếp)" là nút để nó cắt.
+    The RAG stack chunks by the outline tree rather than by page, so a
+    four-thousand-token section yields exactly one four-thousand-token chunk and
+    is truncated at embedding time. The "(tiếp)" line is the node it splits on.
     """
     from docindex.chunker import MAX_TOKENS
 
@@ -1953,19 +1969,19 @@ def test_long_section_is_reopened_with_a_continuation_line(laid_out):
                     continue
                 run += item.tokens
                 assert run <= MAX_TOKENS * 2, (
-                    f"{os.path.basename(path)}: khối {run} token không có dòng "
-                    "'(tiếp)' nào cắt")
-    assert seen, "không tài liệu nào có mục dài phải cắt — mẫu không đủ"
+                    f"{os.path.basename(path)}: a {run} token block has no "
+                    "'(tiếp)' line splitting it")
+    assert seen, "no document has a section long enough to split — sample too small"
 
 
-# --- ngắt trang ------------------------------------------------------------
+# --- page breaks ----------------------------------------------------------
 
 def test_no_heading_is_left_alone_at_the_bottom_of_a_page(processed, tmp_path_factory):
-    """Tiêu đề không được đứng trơ cuối trang, cũng không được vắt qua hai trang.
+    """A heading is never stranded at the foot of a page, nor split across two.
 
-    Mô hình DLA đọc cây chỉ mục theo từng trang. Tiêu đề nằm cuối trang này còn
-    nội dung của nó ở trang sau thì nó bị đọc thành một mục rỗng, và nội dung
-    trang sau thành một mục không có tên.
+    A DLA model reads the outline page by page. A heading at the foot of one
+    page with its content on the next is read as an empty section, and the next
+    page's content as a section with no name.
     """
     import fitz
 
@@ -1982,20 +1998,20 @@ def test_no_heading_is_left_alone_at_the_bottom_of_a_page(processed, tmp_path_fa
         finally:
             doc.close()
         assert not stranded, (
-            f"{os.path.basename(path)}: tiêu đề đứng trơ ở trang "
+            f"{os.path.basename(path)}: heading stranded on page "
             f"{sorted(p + 1 for p in stranded)}")
         checked += 1
-    assert checked, "không dựng được tài liệu nào để kiểm tra"
+    assert checked, "no document could be rebuilt for checking"
 
 
-# --- sơ đồ vẽ bằng nét ------------------------------------------------------
+# --- vector diagrams ------------------------------------------------------
 
 def test_flowchart_is_kept_as_a_picture(tmp_path):
-    """Lưu đồ quy trình phải giữ nguyên dạng hình, không bị moi thành chữ.
+    """A process flowchart stays a picture; it is not pulled apart into text.
 
-    Lưu đồ là nét vẽ cộng với chữ trong từng ô. Trích xuất theo lối thường sẽ
-    xếp hết chữ trong các ô thành một dòng dài vô nghĩa và bản thân sơ đồ biến
-    mất — vừa mất hình vừa thêm nhiễu.
+    A flowchart is vector strokes plus the text inside each box. Ordinary
+    extraction lays all that text into one meaningless line and the diagram
+    itself disappears — losing the picture and adding noise at once.
     """
     import fitz
 
@@ -2004,25 +2020,25 @@ def test_flowchart_is_kept_as_a_picture(tmp_path):
     name = "Quy định phan phoi trai phieu LPBank ra công chúng.pdf"
     path = os.path.join(TEST_DIR, "Tiết kiệm kênh bank", name)
     if not os.path.isfile(path):
-        pytest.skip("thiếu file mẫu có lưu đồ")
+        pytest.skip("the sample file containing a flowchart is missing")
 
     doc = fitz.open(path)
     try:
         found = [page.number + 1 for page in doc if collect_vector_figures(page)]
     finally:
         doc.close()
-    assert found, "không nhận ra lưu đồ nào"
+    assert found, "no flowchart was recognised"
 
     chunks, _sections, _src = process_file(
         path, CFG, figure_dir=str(tmp_path / "figures"))
     body = " ".join(c.raw_text for c in chunks)
-    assert "[FIGURE:" in body, "lưu đồ không để lại dòng giữ chỗ nào"
-    # chữ trong ô của lưu đồ không được moi ra thành nội dung
+    assert "[FIGURE:" in body, "the flowchart left no placeholder line"
+    # the text inside the flowchart's boxes must not be pulled out as content
     assert "Tiếp nhận và khai báo" not in body
 
 
 def test_a_bordered_table_is_not_taken_for_a_flowchart():
-    """Bảng cũng vẽ bằng nét, nhưng toàn nét ngang dọc — không phải sơ đồ."""
+    """Tables are drawn with strokes too, but all orthogonal — not diagrams."""
     import fitz
 
     from docindex.images import collect_vector_figures
@@ -2034,7 +2050,8 @@ def test_a_bordered_table_is_not_taken_for_a_flowchart():
         try:
             for page in doc:
                 for figure in collect_vector_figures(page):
-                    # mọi hình nhận ra được đều phải vì có nét chéo hoặc nét cong
-                    assert "nét chéo/cong" in figure.reason
+                    # every figure found must be found for its diagonal or
+                    # curved strokes
+                    assert "diagonal/curved" in figure.reason
         finally:
             doc.close()

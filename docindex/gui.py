@@ -1,6 +1,6 @@
-"""Giao diện đồ hoạ: kéo thả file PDF/DOCX vào là xử lý.
+"""Graphical interface: drop PDF/DOCX files in and they are processed.
 
-Chạy bằng:  python -m docindex.gui
+Run it with:  python -m docindex.gui
 """
 from __future__ import annotations
 
@@ -19,39 +19,40 @@ from .models import document_title
 from .pipeline import SUPPORTED, iter_input_files, process_file
 from .report import check, format_outline, scanned_warning
 
-try:  # kéo thả cần thư viện ngoài; thiếu thì vẫn chạy bằng nút chọn file
+try:  # drag and drop needs a third-party library; without it the buttons work
     from tkinterdnd2 import DND_FILES, TkinterDnD
     HAS_DND = True
-except ImportError:  # pragma: no cover - phụ thuộc môi trường
+except ImportError:  # pragma: no cover - environment dependent
     DND_FILES = None
     TkinterDnD = None
     HAS_DND = False
 
-# Định dạng của bản tài liệu dựng lại: nhãn hiển thị -> giá trị cho export.
-# .pdf đứng đầu vì mô hình DLA đọc PDF chuẩn hơn hẳn .docx.
-FORMATS = {"Xuất ra .pdf": "pdf", "Xuất ra .docx": "docx", "Giống file gốc": "same"}
+# Format of the rebuilt document: displayed label -> value passed to export.
+# .pdf comes first because a DLA model reads PDF far more reliably than .docx.
+FORMATS = {"Write .pdf": "pdf", "Write .docx": "docx", "Same as source": "same"}
 FORMAT_LABELS = list(FORMATS)
 
-# Mức làm sạch dựng sẵn: nhãn -> trạng thái từng ô đánh dấu bên dưới.
+# Preset cleaning levels: label -> state of each checkbox below.
 #
-# Mục đầu tiên là mặc định vì nó là mức an toàn nhất: gỡ logo với ảnh bìa cho
-# nhẹ tài liệu, còn chữ thì nằm y nguyên chỗ cũ. Gỡ đầu/chân trang hay mục lục
-# là sửa nội dung, phải do người dùng chủ động chọn.
+# The first entry is the default because it is the safest: strip the logo and
+# cover art to lighten the document while the text stays exactly where it was.
+# Removing headers, footers or the table of contents edits the content, so the
+# user has to choose that deliberately.
 CLEAN_PRESETS: dict[str, dict[str, bool]] = {
-    "Chỉ gỡ logo và ảnh bìa": {
+    "Logo and cover art only": {
         "drop_logo": True, "drop_cover": True,
         "drop_header_footer": False, "drop_toc": False, "rebuild": False},
-    "Gỡ thêm đầu/chân trang": {
+    "Also headers and footers": {
         "drop_logo": True, "drop_cover": True,
         "drop_header_footer": True, "drop_toc": False, "rebuild": False},
-    "Làm sạch toàn bộ, giữ bố cục": {
+    "Full clean, keep layout": {
         "drop_logo": True, "drop_cover": True,
         "drop_header_footer": True, "drop_toc": True, "rebuild": False},
-    "Dựng lại bố cục cho RAG": {
+    "Rebuild layout for RAG": {
         "drop_logo": True, "drop_cover": True,
         "drop_header_footer": True, "drop_toc": True, "rebuild": True},
 }
-CUSTOM_PRESET = "Tuỳ chỉnh"
+CUSTOM_PRESET = "Custom"
 PRESET_LABELS = [*CLEAN_PRESETS, CUSTOM_PRESET]
 DEFAULT_PRESET = PRESET_LABELS[0]
 
@@ -67,9 +68,9 @@ ERR = "#c0392b"
 
 
 def parse_drop(data: str) -> list[str]:
-    """Tách chuỗi đường dẫn do hệ điều hành gửi khi thả file.
+    """Split the path string the OS sends when files are dropped.
 
-    Đường dẫn có dấu cách được bọc trong ngoặc nhọn, ví dụ:
+    Paths containing spaces are wrapped in braces, for example:
     "{C:/Tài liệu/a.pdf} C:/b.docx"
     """
     paths: list[str] = []
@@ -96,7 +97,7 @@ def parse_drop(data: str) -> list[str]:
 
 
 def expand_inputs(paths: list[str]) -> list[str]:
-    """Thư mục thì quét file bên trong, file thì giữ nếu đúng định dạng."""
+    """Scan folders for files inside; keep files whose format is supported."""
     out: list[str] = []
     for p in paths:
         p = p.strip('"')
@@ -127,7 +128,7 @@ class App:
         self.page_per_section = tk.BooleanVar(value=False)
         self.save_outline = tk.BooleanVar(value=True)
 
-        # Từng thứ cần gỡ khi làm sạch — mặc định lấy theo mức dựng sẵn đầu tiên
+        # What to strip while cleaning — defaults come from the first preset
         self.clean_preset = tk.StringVar(value=DEFAULT_PRESET)
         self.drop_logo = tk.BooleanVar()
         self.drop_cover = tk.BooleanVar()
@@ -144,13 +145,13 @@ class App:
         for key, value in CLEAN_PRESETS[DEFAULT_PRESET].items():
             self._clean_vars[key].set(value)
 
-        # cây chỉ mục của từng tài liệu vừa xử lý, để soát lại bằng mắt
+        # outline tree of each processed document, for visual review
         self.outlines: list[tuple[str, str]] = []
         self.out_format = tk.StringVar(value=FORMAT_LABELS[0])
 
-        root.title("docindex — Chia tài liệu thành chunk cho RAG")
-        # Bảng tuỳ chọn khá cao; màn hình thấp thì thu lại cho vừa thay vì để
-        # nút "Bắt đầu xử lý" và ô nhật ký bị đẩy khuất xuống dưới mép dưới.
+        root.title("docindex — split documents into chunks for RAG")
+        # The options panel is tall; on a short screen the window shrinks to fit
+        # rather than pushing the Run button and the log off the bottom edge.
         height = min(970, max(660, root.winfo_screenheight() - 90))
         root.geometry(f"1000x{height}")
         root.minsize(900, 640)
@@ -161,7 +162,7 @@ class App:
         self._show_dnd_state(self._enable_dnd())
         self.root.after(80, self._drain_events)
 
-    # ---------- giao diện ----------
+    # ---------- interface ----------
 
     def _build_styles(self) -> None:
         style = ttk.Style()
@@ -187,13 +188,13 @@ class App:
         ttk.Label(head, text="docindex", style="Title.TLabel").pack(anchor="w")
         self.hint_label = ttk.Label(
             head, style="Sub.TLabel",
-            text="Kéo thả file PDF/DOCX hoặc cả thư mục vào ô bên dưới")
+            text="Drop PDF/DOCX files, or a whole folder, into the area below")
         self.hint_label.pack(anchor="w", pady=(2, 0))
 
         body = ttk.Frame(self.root, padding=(18, 6, 18, 12))
         body.pack(fill="both", expand=True)
 
-        # --- vùng thả file ---
+        # --- drop area ---
         self.drop = tk.Frame(body, bg=DROP_IDLE, height=86,
                              highlightthickness=2, highlightbackground="#9db6e0")
         self.drop.pack(fill="x")
@@ -201,20 +202,20 @@ class App:
         self.drop_label = tk.Label(
             self.drop, bg=DROP_IDLE, fg="#2b3b55", justify="center",
             font=("Segoe UI", 11),
-            text="⬇  Thả tài liệu vào đây\nChấp nhận .pdf, .docx hoặc thư mục",
+            text="⬇  Drop documents here\nAccepts .pdf, .docx or a folder",
         )
         self.drop_label.pack(expand=True)
 
         btns = ttk.Frame(body)
         btns.pack(fill="x", pady=(8, 10))
-        ttk.Button(btns, text="Chọn file…", command=self.pick_files).pack(side="left")
-        ttk.Button(btns, text="Chọn thư mục…", command=self.pick_folder).pack(side="left", padx=6)
-        ttk.Button(btns, text="Bỏ mục đã chọn", command=self.remove_selected).pack(side="left")
-        ttk.Button(btns, text="Xoá hết", command=self.clear_files).pack(side="left", padx=6)
-        self.count_label = ttk.Label(btns, text="Chưa có tài liệu nào", style="Sub.TLabel")
+        ttk.Button(btns, text="Choose files…", command=self.pick_files).pack(side="left")
+        ttk.Button(btns, text="Choose folder…", command=self.pick_folder).pack(side="left", padx=6)
+        ttk.Button(btns, text="Remove selected", command=self.remove_selected).pack(side="left")
+        ttk.Button(btns, text="Clear all", command=self.clear_files).pack(side="left", padx=6)
+        self.count_label = ttk.Label(btns, text="No documents yet", style="Sub.TLabel")
         self.count_label.pack(side="right")
 
-        # --- danh sách file ---
+        # --- file list ---
         list_wrap = ttk.Frame(body)
         list_wrap.pack(fill="both", expand=True)
         self.listbox = tk.Listbox(
@@ -227,10 +228,10 @@ class App:
         sb.pack(side="right", fill="y")
         self.listbox.configure(yscrollcommand=sb.set)
 
-        # --- tuỳ chọn ---
+        # --- options ---
         opt = ttk.Frame(body, style="Card.TFrame", padding=12)
         opt.pack(fill="x", pady=(12, 0))
-        ttk.Label(opt, text="Tuỳ chọn", style="Card.TLabel",
+        ttk.Label(opt, text="Options", style="Card.TLabel",
                   font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=6)
 
         def spin(col, label, var, lo, hi, step, tip):
@@ -244,34 +245,34 @@ class App:
                                                  sticky="w", pady=(0, 4))
             return box
 
-        spin(0, "Trần token", self.max_tokens, 128, 2048, 32, "token mỗi chunk")
-        self.min_spin = spin(2, "Ngưỡng gộp", self.min_tokens, 0, 400, 10,
-                             "chunk ngắn hơn sẽ gộp")
-        spin(4, "Câu lặp lại", self.overlap, 0, 5, 1, "khi mục bị cắt ngang trang")
+        spin(0, "Token ceiling", self.max_tokens, 128, 2048, 32, "tokens per chunk")
+        self.min_spin = spin(2, "Merge threshold", self.min_tokens, 0, 400, 10,
+                             "shorter chunks are merged")
+        spin(4, "Overlap sentences", self.overlap, 0, 5, 1, "when a section spans pages")
 
-        # Gộp mục ngắn nằm ngay dưới ô ngưỡng vì hai thứ đi liền nhau: tắt gộp
-        # thì ngưỡng không còn tác dụng gì.
-        ttk.Checkbutton(opt, text="Gộp mục ngắn vào mục liền trước",
+        # The merge switch sits right under its threshold because the two belong
+        # together: turn merging off and the threshold does nothing.
+        ttk.Checkbutton(opt, text="Merge short sections into a neighbour",
                         variable=self.merge_short, command=self._sync_merge_short,
                         style="Card.TCheckbutton").grid(row=3, column=0, columnspan=3,
                                                         sticky="w", pady=(6, 0))
-        ttk.Checkbutton(opt, text="Chèn đường dẫn mục lục vào nội dung chunk",
+        ttk.Checkbutton(opt, text="Prepend the outline path to chunk text",
                         variable=self.add_prefix,
                         style="Card.TCheckbutton").grid(row=3, column=3, columnspan=3,
                                                         sticky="w", pady=(6, 0))
-        ttk.Checkbutton(opt, text="Xuất thêm chunk .jsonl cho RAG",
+        ttk.Checkbutton(opt, text="Also write .jsonl chunks for RAG",
                         variable=self.make_jsonl,
                         style="Card.TCheckbutton").grid(row=4, column=0, columnspan=3,
                                                         sticky="w")
-        ttk.Checkbutton(opt, text="Gộp chunk vào một file chunks.jsonl",
+        ttk.Checkbutton(opt, text="Merge chunks into one chunks.jsonl",
                         variable=self.merge,
                         style="Card.TCheckbutton").grid(row=4, column=3, columnspan=3,
                                                         sticky="w")
-        ttk.Checkbutton(opt, text="Tách thêm hình ra file PNG riêng",
+        ttk.Checkbutton(opt, text="Also export figures as PNG files",
                         variable=self.extract_figures,
                         style="Card.TCheckbutton").grid(row=5, column=0, columnspan=3,
                                                         sticky="w")
-        ttk.Checkbutton(opt, text="Xuất cây chỉ mục ra file .txt",
+        ttk.Checkbutton(opt, text="Write the outline tree to a .txt file",
                         variable=self.save_outline,
                         style="Card.TCheckbutton").grid(row=5, column=3, columnspan=3,
                                                         sticky="w")
@@ -281,27 +282,27 @@ class App:
 
         out = ttk.Frame(body)
         out.pack(fill="x", pady=(12, 0))
-        ttk.Label(out, text="Lưu kết quả vào:").pack(side="left")
+        ttk.Label(out, text="Save results to:").pack(side="left")
         ttk.Entry(out, textvariable=self.output_dir).pack(
             side="left", fill="x", expand=True, padx=8)
-        ttk.Button(out, text="Đổi…", command=self.pick_output).pack(side="left")
+        ttk.Button(out, text="Change…", command=self.pick_output).pack(side="left")
 
-        # --- chạy ---
+        # --- run ---
         run = ttk.Frame(body)
         run.pack(fill="x", pady=(12, 6))
-        self.run_btn = ttk.Button(run, text="▶  Bắt đầu xử lý",
+        self.run_btn = ttk.Button(run, text="▶  Start processing",
                                   style="Run.TButton", command=self.start)
         self.run_btn.pack(side="left")
-        self.open_btn = ttk.Button(run, text="Mở thư mục kết quả",
+        self.open_btn = ttk.Button(run, text="Open output folder",
                                    command=self.open_output)
         self.open_btn.pack(side="left", padx=8)
-        self.outline_btn = ttk.Button(run, text="Xem cây chỉ mục",
+        self.outline_btn = ttk.Button(run, text="View outline tree",
                                       command=self.show_outline, state="disabled")
         self.outline_btn.pack(side="left")
         self.progress = ttk.Progressbar(run, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=(12, 0))
 
-        # --- nhật ký ---
+        # --- log ---
         log_wrap = ttk.Frame(body)
         log_wrap.pack(fill="both", expand=True)
         self.log = tk.Text(log_wrap, height=9, wrap="word", font=("Consolas", 9),
@@ -318,13 +319,13 @@ class App:
 
 
     def _build_clean_card(self, body) -> None:
-        """Bảng chọn từng thứ cần gỡ khỏi bản tài liệu đã làm sạch."""
+        """The panel for choosing what gets stripped from the cleaned document."""
         card = ttk.Frame(body, style="Card.TFrame", padding=12)
         card.pack(fill="x", pady=(10, 0))
-        ttk.Label(card, text="Làm sạch tài liệu", style="Card.TLabel",
+        ttk.Label(card, text="Document cleaning", style="Card.TLabel",
                   font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w",
                                                       columnspan=2)
-        ttk.Label(card, text="Mức làm sạch:", style="Card.TLabel").grid(
+        ttk.Label(card, text="Cleaning level:", style="Card.TLabel").grid(
             row=0, column=2, sticky="e", padx=(0, 6))
         self.preset_combo = ttk.Combobox(card, textvariable=self.clean_preset,
                                          values=PRESET_LABELS, state="readonly",
@@ -332,7 +333,7 @@ class App:
         self.preset_combo.grid(row=0, column=3, sticky="w")
         self.preset_combo.bind("<<ComboboxSelected>>", self._apply_preset)
 
-        ttk.Checkbutton(card, text="Xuất bản tài liệu đã làm sạch",
+        ttk.Checkbutton(card, text="Write the cleaned document",
                         variable=self.make_clean, command=self._sync_clean,
                         style="Card.TCheckbutton").grid(row=1, column=0, columnspan=4,
                                                         sticky="w", pady=(8, 2))
@@ -345,27 +346,27 @@ class App:
             return box
 
         self.drop_boxes = {
-            "drop_logo": drop_box(2, 0, "Gỡ logo và hoạ tiết lặp lại", self.drop_logo),
-            "drop_cover": drop_box(2, 2, "Gỡ ảnh bìa ở trang đầu", self.drop_cover),
-            "drop_header_footer": drop_box(3, 0, "Gỡ chữ đầu trang / chân trang",
+            "drop_logo": drop_box(2, 0, "Strip logos and repeated ornaments", self.drop_logo),
+            "drop_cover": drop_box(2, 2, "Strip cover art on the first page", self.drop_cover),
+            "drop_header_footer": drop_box(3, 0, "Strip header / footer text",
                                            self.drop_header_footer),
-            "drop_toc": drop_box(3, 2, "Gỡ phần mục lục", self.drop_toc),
+            "drop_toc": drop_box(3, 2, "Strip the table of contents", self.drop_toc),
         }
 
         self.rebuild_box = ttk.Checkbutton(
-            card, text="Dựng lại bố cục cho hệ RAG đọc cây chỉ mục",
+            card, text="Rebuild the layout for a RAG stack reading the outline",
             variable=self.rebuild, command=self._on_clean_toggle,
             style="Card.TCheckbutton")
         self.rebuild_box.grid(row=4, column=0, columnspan=2, sticky="w",
                               padx=(18, 12), pady=(6, 0))
-        self.format_label = ttk.Label(card, text="Định dạng bản dựng lại:",
+        self.format_label = ttk.Label(card, text="Rebuilt document format:",
                                       style="Card.TLabel")
         self.format_label.grid(row=4, column=2, sticky="e", padx=(0, 6), pady=(6, 0))
         self.format_combo = ttk.Combobox(card, textvariable=self.out_format,
                                          values=FORMAT_LABELS, state="readonly",
                                          width=16)
         self.format_combo.grid(row=4, column=3, sticky="w", pady=(6, 0))
-        self.page_box = ttk.Checkbutton(card, text="Mỗi mục một trang riêng",
+        self.page_box = ttk.Checkbutton(card, text="One page per section",
                                         variable=self.page_per_section,
                                         style="Card.TCheckbutton")
         self.page_box.grid(row=5, column=0, columnspan=2, sticky="w", padx=(36, 12))
@@ -376,10 +377,10 @@ class App:
         self.clean_note.grid(row=6, column=0, columnspan=4, sticky="w", pady=(8, 0))
         self._sync_clean()
 
-    # ---------- đồng bộ các ô cấu hình ----------
+    # ---------- keeping the settings in sync ----------
 
     def _apply_preset(self, _event=None) -> None:
-        """Chọn một mức dựng sẵn thì tick lại toàn bộ các ô bên dưới."""
+        """Choosing a preset re-ticks every checkbox below it."""
         preset = CLEAN_PRESETS.get(self.clean_preset.get())
         if preset:
             for key, value in preset.items():
@@ -387,7 +388,7 @@ class App:
         self._sync_clean()
 
     def _on_clean_toggle(self) -> None:
-        """Tự tay đổi một ô thì mức làm sạch nhảy về đúng tên của tổ hợp đó."""
+        """Ticking a box by hand moves the level to whichever preset now matches."""
         current = {k: v.get() for k, v in self._clean_vars.items()}
         match = next((name for name, preset in CLEAN_PRESETS.items()
                       if preset == current), CUSTOM_PRESET)
@@ -395,7 +396,7 @@ class App:
         self._sync_clean()
 
     def _sync_clean(self) -> None:
-        """Làm mờ những ô không còn tác dụng và nói rõ lần chạy này gỡ những gì."""
+        """Grey out the boxes that no longer apply and spell out what this run strips."""
         on = self.make_clean.get()
         rebuilding = on and self.rebuild.get()
         state = "normal" if on else "disabled"
@@ -404,13 +405,14 @@ class App:
         self.rebuild_box.configure(state=state)
         self.page_box.configure(state="normal" if rebuilding else "disabled")
         self.format_combo.configure(state="readonly" if rebuilding else "disabled")
-        # ttk.Label không tự mờ đi theo state trên mọi theme, phải đổi màu tay
+        # ttk.Label does not grey out with state on every theme; recolour by hand
         self.format_label.configure(
             foreground="#22303f" if rebuilding else "#9aa4b1")
 
-        # Bản dựng lại lấy nội dung từ cây mục lục đã trích xuất, ở đó logo,
-        # đầu/chân trang và mục lục đã bị loại từ trước — mấy ô này không còn
-        # gì để điều khiển nữa, trừ ảnh bìa vẫn do người dùng quyết.
+        # The rebuild takes its content from the extracted outline, where logos,
+        # headers, footers and the table of contents were already dropped — these
+        # boxes have nothing left to control, except cover art, which stays the
+        # user's call.
         for key, box in self.drop_boxes.items():
             usable = on and (not rebuilding or key == "drop_cover")
             box.configure(state="normal" if usable else "disabled")
@@ -419,35 +421,36 @@ class App:
 
     def _clean_summary(self, on: bool, rebuilding: bool) -> str:
         if not on:
-            return ("Đang tắt — không xuất bản tài liệu đã làm sạch, "
-                    "chỉ chạy phần chunk.")
+            return ("Off — no cleaned document is written, only the chunking "
+                    "runs.")
         if rebuilding:
-            keep = "" if self.drop_cover.get() else " Ảnh bìa trang đầu được giữ lại."
-            return ("Bản dựng lại luôn bỏ logo, đầu/chân trang và mục lục vì nội "
-                    "dung lấy từ cây mục lục đã trích xuất." + keep)
+            keep = "" if self.drop_cover.get() else " Cover art on page one is kept."
+            return ("The rebuild always drops logos, headers, footers and the "
+                    "table of contents, because its content comes from the "
+                    "extracted outline." + keep)
         picked = [label for key, label in (
-            ("drop_logo", "logo và hoạ tiết lặp"),
-            ("drop_cover", "ảnh bìa"),
-            ("drop_header_footer", "chữ đầu/chân trang"),
-            ("drop_toc", "phần mục lục"),
+            ("drop_logo", "logos and repeated ornaments"),
+            ("drop_cover", "cover art"),
+            ("drop_header_footer", "header/footer text"),
+            ("drop_toc", "the table of contents"),
         ) if self._clean_vars[key].get()]
         if not picked:
-            return ("Không gỡ gì cả — file kết quả sẽ giống hệt bản gốc. "
-                    "Hãy tick ít nhất một mục.")
-        return ("Giữ nguyên bố cục gốc, chỉ gỡ: " + ", ".join(picked)
-                + ". Hình minh hoạ trong nội dung vẫn được giữ lại.")
+            return ("Nothing is stripped — the output would be identical to the "
+                    "original. Tick at least one item.")
+        return ("Keeping the original layout, stripping only: " + ", ".join(picked)
+                + ". Figures in the body are always kept.")
 
     def _sync_merge_short(self) -> None:
-        """Tắt gộp thì ô ngưỡng gộp mờ đi — nó không còn ảnh hưởng gì nữa."""
+        """With merging off the threshold box greys out — it no longer changes anything."""
         self.min_spin.configure(
             state="normal" if self.merge_short.get() else "disabled")
 
     def _enable_dnd(self) -> bool:
-        """Bật kéo thả. Trả về False nếu máy không dùng được.
+        """Enable drag and drop. Returns False when this machine cannot use it.
 
-        `tkinterdnd2` có thể cài rồi mà vẫn hỏng: nó nạp thư viện tkdnd biên
-        dịch sẵn, bản không khớp với Tk đang chạy sẽ ném TclError ngay lúc
-        đăng ký vùng thả.
+        `tkinterdnd2` can be installed and still fail: it loads a prebuilt tkdnd
+        library, and a build that does not match the running Tk raises TclError
+        at the moment the drop target is registered.
         """
         if not HAS_DND:
             return False
@@ -462,29 +465,29 @@ class App:
         return True
 
     def _show_dnd_state(self, ready: bool) -> None:
-        """Nói thẳng khi không kéo thả được.
+        """Say plainly when drag and drop is unavailable.
 
-        Vùng thả vẫn mời "Thả tài liệu vào đây" trong khi thư viện chưa có thì
-        người dùng thả xong không thấy gì xảy ra và không biết vì sao.
+        If the drop area still invites "Drop documents here" while the library is
+        missing, the user drops a file, nothing happens, and there is no clue why.
         """
         if ready:
-            self._say("Sẵn sàng. Thả tài liệu vào ô phía trên để bắt đầu.", "dim")
+            self._say("Ready. Drop documents into the area above to begin.", "dim")
             return
         self.hint_label.configure(
-            text="Bấm nút để chọn file — máy này chưa kéo thả được")
+            text="Use the buttons to choose files — drag and drop is unavailable here")
         self.drop_label.configure(
-            text="Kéo thả chưa dùng được trên máy này\n"
-                 "Bấm “Chọn file…” hoặc “Chọn thư mục…” bên dưới",
+            text="Drag and drop is unavailable on this machine\n"
+                 "Use “Choose files…” or “Choose folder…” below",
             fg="#7a4b00")
         self._paint_drop("#f3e6cc")
-        self._say("Không kéo thả được: thiếu thư viện tkinterdnd2.", "warn")
-        self._say("Cài bằng lệnh:  pip install tkinterdnd2   rồi mở lại.", "warn")
+        self._say("Drag and drop unavailable: the tkinterdnd2 library is missing.", "warn")
+        self._say("Install it with:  pip install tkinterdnd2   then reopen.", "warn")
 
     def _paint_drop(self, colour: str) -> None:
         self.drop.configure(bg=colour)
         self.drop_label.configure(bg=colour)
 
-    # ---------- thao tác file ----------
+    # ---------- file handling ----------
 
     def _on_drop(self, event):
         self._paint_drop(DROP_IDLE)
@@ -495,7 +498,7 @@ class App:
         )
         self.add_files(found)
         if rejected > 0:
-            self._say(f"Bỏ qua {rejected} mục không phải .pdf/.docx", "warn")
+            self._say(f"Skipped {rejected} items that are not .pdf/.docx", "warn")
 
     def add_files(self, paths: list[str]) -> None:
         added = 0
@@ -506,30 +509,30 @@ class App:
                 self.listbox.insert("end", f"  {os.path.basename(full)}")
                 added += 1
         if added:
-            self._say(f"Đã thêm {added} tài liệu", "ok")
+            self._say(f"Added {added} documents", "ok")
         self._refresh_count()
 
     def _refresh_count(self) -> None:
         n = len(self.files)
         self.count_label.configure(
-            text="Chưa có tài liệu nào" if n == 0 else f"{n} tài liệu")
+            text="No documents yet" if n == 0 else f"{n} documents")
 
     def pick_files(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="Chọn tài liệu",
-            filetypes=[("Tài liệu PDF/Word", "*.pdf *.docx"), ("Tất cả", "*.*")])
+            title="Choose documents",
+            filetypes=[("PDF/Word documents", "*.pdf *.docx"), ("All files", "*.*")])
         self.add_files(expand_inputs(list(paths)))
 
     def pick_folder(self) -> None:
-        folder = filedialog.askdirectory(title="Chọn thư mục chứa tài liệu")
+        folder = filedialog.askdirectory(title="Choose a folder of documents")
         if folder:
             found = iter_input_files(folder)
             if not found:
-                self._say("Thư mục không có file .pdf hoặc .docx nào", "warn")
+                self._say("That folder holds no .pdf or .docx files", "warn")
             self.add_files(found)
 
     def pick_output(self) -> None:
-        folder = filedialog.askdirectory(title="Chọn nơi lưu kết quả")
+        folder = filedialog.askdirectory(title="Choose where to save the results")
         if folder:
             self.output_dir.set(folder)
 
@@ -556,20 +559,20 @@ class App:
             else:
                 subprocess.run(["xdg-open", path], check=False)
         except OSError as exc:
-            messagebox.showerror("Không mở được thư mục", str(exc))
+            messagebox.showerror("Could not open the folder", str(exc))
 
-    # ---------- xử lý ----------
+    # ---------- processing ----------
 
     def start(self) -> None:
         if self.running:
             return
         if not self.files:
-            messagebox.showinfo("Chưa có tài liệu",
-                                "Hãy kéo thả hoặc chọn ít nhất một file .pdf/.docx.")
+            messagebox.showinfo("No documents",
+                                "Drop or choose at least one .pdf/.docx file.")
             return
         out_dir = self.output_dir.get().strip()
         if not out_dir:
-            messagebox.showinfo("Thiếu thư mục", "Hãy chọn nơi lưu kết quả.")
+            messagebox.showinfo("No output folder", "Choose where to save the results.")
             return
 
         cfg = ChunkConfig(
@@ -580,7 +583,7 @@ class App:
             merge_short=self.merge_short.get(),
         )
         self.running = True
-        self.run_btn.configure(state="disabled", text="Đang xử lý…")
+        self.run_btn.configure(state="disabled", text="Processing…")
         self.outline_btn.configure(state="disabled")
         self.outlines = []
         self.progress.configure(maximum=len(self.files), value=0)
@@ -607,17 +610,17 @@ class App:
         worker.start()
 
     def _work(self, files, out_dir, cfg, opts) -> None:
-        """Chạy trong luồng riêng để cửa sổ không bị treo."""
+        """Runs on its own thread so the window does not freeze."""
         put = self.events.put
         try:
             os.makedirs(out_dir, exist_ok=True)
         except OSError as exc:
-            put(("error", f"Không tạo được thư mục kết quả: {exc}"))
+            put(("error", f"Could not create the output folder: {exc}"))
             put(("done", None))
             return
 
         rebuild = opts["make_clean"] and opts["rebuild"]
-        # Bản dựng lại cần file ảnh để nhúng hình minh hoạ vào tài liệu mới
+        # The rebuild needs the image files in order to embed figures
         figure_dir = (os.path.join(out_dir, "figures")
                       if opts["want_figures"] or rebuild else None)
         merge = opts["merge"]
@@ -631,21 +634,22 @@ class App:
             try:
                 chunks, sections, page_source = process_file(
                     path, cfg, figure_dir=figure_dir, stats=stats)
-            except Exception as exc:  # một file hỏng không nên chặn cả lô
+            except Exception as exc:  # one bad file should not stop the whole batch
                 failed += 1
-                put(("error", f"    Lỗi: {type(exc).__name__}: {exc}"))
+                put(("error", f"    Error: {type(exc).__name__}: {exc}"))
                 put(("step", index))
                 continue
 
-            # Bản scan thì mọi thứ phía sau đều vô nghĩa — cây chỉ mục rỗng,
-            # chunk chỉ có dòng [HÌNH]. Nói ngay ở đây chứ không đợi tới phần
-            # báo cáo, vì người chỉ làm sạch tài liệu không chạy tới đó.
+            # For a scan everything downstream is meaningless — the outline is
+            # empty and the chunks hold nothing but [FIGURE] lines. Say so here
+            # rather than waiting for the report, because someone who only cleans
+            # documents never gets that far.
             scanned = scanned_warning(stats)
             if scanned:
                 put(("warn", f"    ! {scanned}"))
 
-            # Cây chỉ mục dựng xong ngay sau khi trích xuất, không phụ thuộc
-            # vào việc có xuất chunk hay không — đây là thứ cần soát trước hết.
+            # The outline is ready right after extraction, whether or not chunks
+            # are written — and it is the first thing that needs reviewing.
             tree = format_outline(sections, document_title(path))
             put(("outline", (name, tree)))
             if opts["save_outline"]:
@@ -654,7 +658,7 @@ class App:
                     with open(target, "w", encoding="utf-8") as f:
                         f.write(tree + "\n")
                 except OSError as exc:
-                    put(("warn", f"    Không ghi được cây chỉ mục: {exc}"))
+                    put(("warn", f"    Could not write the outline: {exc}"))
 
             if opts["make_clean"]:
                 try:
@@ -665,20 +669,20 @@ class App:
                             drop_cover=opts["clean"].drop_cover,
                             max_tokens=cfg.max_tokens,
                             page_per_section=opts["page_per_section"])
-                        note = (f"       {cstats['pages_out']} trang cho "
-                                f"{cstats['sections_out']} mục · "
-                                f"giữ {cstats['figures_kept']} hình")
+                        note = (f"       {cstats['pages_out']} pages for "
+                                f"{cstats['sections_out']} sections · "
+                                f"{cstats['figures_kept']} figures kept")
                     else:
                         dst, cstats = clean_document(
                             path, out_dir, opts=opts["clean"])
-                        note = (f"       gỡ {cstats['images_removed']} ảnh nhiễu · "
-                                f"giữ {cstats['figures_kept']} hình trong file")
+                        note = (f"       {cstats['images_removed']} noise images removed · "
+                                f"{cstats['figures_kept']} figures kept in the file")
                     stats["cleaned_file"] = os.path.basename(dst)
                     stats.update({f"clean_{k}": v for k, v in cstats.items()})
                     put(("ok", f"    → {os.path.basename(dst)}"))
                     put(("info", note))
                 except Exception as exc:
-                    put(("error", f"    Không làm sạch được: {type(exc).__name__}: {exc}"))
+                    put(("error", f"    Could not clean it: {type(exc).__name__}: {exc}"))
 
             if not opts["make_jsonl"]:
                 put(("step", index))
@@ -689,13 +693,13 @@ class App:
             info["page_source"] = page_source
             summary.append(info)
 
-            put(("info", f"    {info['chunks']} chunk · {info['headings_detected']} tiêu đề"
-                         f" · cây {info['outline_depth']} cấp"
-                         f" · token: trung vị {info['tokens_median']},"
+            put(("info", f"    {info['chunks']} chunks · {info['headings_detected']} headings"
+                         f" · outline {info['outline_depth']} levels deep"
+                         f" · tokens: median {info['tokens_median']},"
                          f" max {info['tokens_max']}/{info['token_limit']}"))
             if info["logos_dropped"] or info["figures_kept"]:
-                put(("info", f"    đã loại {info['logos_dropped']} logo · "
-                             f"giữ {info['figures_kept']} hình"))
+                put(("info", f"    {info['logos_dropped']} logos dropped · "
+                             f"{info['figures_kept']} figures kept"))
             for warning in info["warnings"]:
                 put(("warn", f"    ! {warning}"))
 
@@ -706,7 +710,7 @@ class App:
                     put(("ok", f"    → {os.path.basename(target)}"))
                 except OSError as exc:
                     failed += 1
-                    put(("error", f"    Không ghi được file: {exc}"))
+                    put(("error", f"    Could not write the file: {exc}"))
             all_chunks.extend(chunks)
             put(("step", index))
 
@@ -714,20 +718,20 @@ class App:
             target = os.path.join(out_dir, "chunks.jsonl")
             try:
                 self._write_jsonl(target, all_chunks)
-                put(("ok", f"→ Đã gộp vào {os.path.basename(target)}"))
+                put(("ok", f"→ Merged into {os.path.basename(target)}"))
             except OSError as exc:
-                put(("error", f"Không ghi được file gộp: {exc}"))
+                put(("error", f"Could not write the merged file: {exc}"))
 
         try:
             with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
                 json.dump(summary, f, ensure_ascii=False, indent=2)
         except OSError as exc:
-            put(("warn", f"Không ghi được report.json: {exc}"))
+            put(("warn", f"Could not write report.json: {exc}"))
 
         ok_count = len(files) - failed
         put(("head", ""))
         put(("ok" if not failed else "warn",
-             f"Xong: {len(all_chunks)} chunk từ {ok_count}/{len(files)} tài liệu"))
+             f"Done: {len(all_chunks)} chunks from {ok_count}/{len(files)} documents"))
         put(("done", None))
 
     @staticmethod
@@ -736,10 +740,10 @@ class App:
             for chunk in chunks:
                 f.write(json.dumps(chunk.to_dict(), ensure_ascii=False) + "\n")
 
-    # ---------- cầu nối luồng nền -> giao diện ----------
+    # ---------- bridge from the worker thread to the interface ----------
 
     def _drain_events(self) -> None:
-        """Tkinter chỉ được cập nhật từ luồng chính, nên đọc qua hàng đợi."""
+        """Tkinter may only be updated from the main thread, so events come by queue."""
         try:
             while True:
                 kind, payload = self.events.get_nowait()
@@ -749,7 +753,7 @@ class App:
                     self.outlines.append(payload)
                 elif kind == "done":
                     self.running = False
-                    self.run_btn.configure(state="normal", text="▶  Bắt đầu xử lý")
+                    self.run_btn.configure(state="normal", text="▶  Start processing")
                     self.open_btn.configure(state="normal")
                     if self.outlines:
                         self.outline_btn.configure(state="normal")
@@ -765,23 +769,25 @@ class App:
         self.root.after(80, self._drain_events)
 
     def show_outline(self) -> None:
-        """Mở cửa sổ xem cây chỉ mục của các tài liệu vừa xử lý.
+        """Open a window showing the outline tree of the documents just processed.
 
-        Hệ RAG dựng title của chunk từ cây này, nên sai một cấp là sai title
-        của mọi chunk bên dưới — cần soát lại bằng mắt trước khi nạp tri thức.
+        A RAG stack builds every chunk title from this tree, so one wrong level is
+        a wrong title on every chunk below it — worth reviewing by eye before the
+        knowledge base is loaded.
         """
         if not self.outlines:
             return
         win = tk.Toplevel(self.root)
-        win.title("Cây chỉ mục — đối chiếu với tài liệu gốc")
+        win.title("Outline tree — check it against the original document")
         win.geometry("900x640")
         win.configure(bg=BG)
 
         wrap = ttk.Frame(win, padding=10)
         wrap.pack(fill="both", expand=True)
         ttk.Label(wrap, style="Sub.TLabel",
-                  text="Mỗi dòng là một đề mục; L1 là cấp cao nhất. Thiếu, thừa "
-                       "hay sai cấp ở đây thì title của chunk sai theo.").pack(anchor="w")
+                  text="Every line is a heading; L1 is the top level. Anything "
+                       "missing, extra or at the wrong level here makes the "
+                       "chunk titles wrong too.").pack(anchor="w")
 
         text = tk.Text(wrap, wrap="none", font=("Consolas", 10), bg=CARD,
                        fg="#22303f", borderwidth=0, padx=10, pady=8)
@@ -810,7 +816,7 @@ class App:
 
 
 def main() -> int:
-    # Console Windows mặc định là cp1252, thông báo lỗi tiếng Việt sẽ vỡ mã
+    # The Windows console defaults to cp1252, which mangles non-ASCII messages
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -819,19 +825,20 @@ def main() -> int:
 
     root = None
     if HAS_DND:
-        # Bản tkdnd không khớp với Tk đang chạy sẽ hỏng ngay ở đây. Mất kéo thả
-        # thì tiếc, nhưng không mở được giao diện mới là hỏng thật.
+        # A tkdnd build that does not match the running Tk fails right here.
+        # Losing drag and drop is a pity; failing to open the window at all is a
+        # real failure.
         try:
             root = TkinterDnD.Tk()
         except (tk.TclError, RuntimeError, OSError) as exc:
-            print(f"Không bật được kéo thả ({exc}), mở giao diện thường.",
+            print(f"Could not enable drag and drop ({exc}); opening the plain window.",
                   file=sys.stderr)
     if root is None:
         try:
             root = tk.Tk()
         except tk.TclError as exc:
-            print(f"Không mở được cửa sổ giao diện: {exc}", file=sys.stderr)
-            print("Bạn vẫn có thể dùng bản dòng lệnh: python -m docindex.cli <đường dẫn>",
+            print(f"Could not open the interface window: {exc}", file=sys.stderr)
+            print("The command line version still works: python -m docindex.cli <path>",
                   file=sys.stderr)
             return 1
 

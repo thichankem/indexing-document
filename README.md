@@ -1,346 +1,545 @@
+<div align="center">
+
 # docindex
 
-Tool làm sạch tài liệu PDF/DOCX và chia chunk cho hệ thống RAG.
+**Clean PDF/DOCX documents and chunk them along their outline, for RAG.**
 
-Tool được chỉnh cho hệ RAG **đọc tài liệu theo cây phân cấp chỉ mục** (Layout
-Analysis → Reconstruction → Chunking), **sâu tối đa 3 cấp**, **chunk trần 512
-token**. Hệ đó tự cắt chunk theo cây nó đọc được từ trang giấy, nên việc của
-tool là làm cây chỉ mục hiện lên **không thể nhầm**:
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-pytest-orange)](tests/)
 
-* tiêu đề và chỉ mục trình bày đúng kiểu văn bản chuẩn — in đậm, cỡ chữ lớn
-  theo cấp, đứng riêng một dòng — để DLA gán nhãn `title` thay vì lẫn vào
-  `text`/`list-item`;
-* cây chỉ mục được soát lại từ chính ký hiệu đánh số, không tin cấp danh sách
-  của Word, và loại các "mục ma" do câu văn bắt đầu bằng số sinh ra;
-* tiêu đề tài liệu đứng đầu làm gốc của cây, vì title mỗi chunk bắt đầu từ đó;
-* tiêu đề không bao giờ bị bỏ trơ ở cuối trang hay vắt qua hai trang;
-* ký hiệu lạ được quy về chữ thường đọc được (`𝐌𝐢` → `Mi`, `∑` → `Tổng`),
-  và lưu đồ vẽ bằng nét được giữ nguyên dạng hình thay vì moi thành chữ;
-* mặc định xuất ra **`.pdf`**, định dạng DLA đọc chuẩn nhất.
+</div>
 
-Mỗi tài liệu cho ra hai thứ:
+---
 
-1. **Bản tài liệu đã làm sạch, dựng lại bố cục** — nội dung chảy liên tục như
-   một văn bản bình thường, tên mục đứng riêng một dòng với cỡ chữ giảm dần
-   theo cấp. Logo, hình bìa, đầu/chân trang và mục lục bị gỡ bỏ; hình minh hoạ
-   nội dung vẫn nằm trong file. Đây là file nên nạp vào RAG. Chọn được mức làm
-   sạch nhẹ hơn — giữ nguyên bố cục gốc, chỉ gỡ đúng những thứ mình muốn — ở
-   bảng **Làm sạch tài liệu** trong giao diện hoặc các tham số `--keep-*`.
-2. **File chunk `.jsonl`** để nạp thẳng vào khâu embedding nếu bạn không dùng
-   DLA — mỗi chunk gọn trong **512 token**, trong **một trang** và thuộc về
-   **một mục** của tài liệu.
+`docindex` takes a messy real-world document — a bank's product regulation, a
+legal circular, an insurance policy — and turns it into two things a retrieval
+pipeline can actually use:
+
+1. **A cleaned, rebuilt document** (`.pdf` by default). Content flows
+   continuously like an ordinary document, every section name alone on its line
+   at a size that shrinks with depth. Logos, cover art, headers, footers and the
+   table of contents are gone; the figures that are real content stay. *This is
+   the file you load into RAG.*
+2. **A `.jsonl` chunk file**, if you are not using a layout-analysis model —
+   every chunk inside **512 tokens**, inside **one page**, and belonging to
+   **one section**.
 
 ```
 output/
-  Quy định ABC_formalized.pdf ← bản sạch để nạp vào RAG (tên gốc + `_formalized`)
-  Quy định ABC.jsonl          ← chunk cho RAG
-  Quy định ABC.outline.txt    ← cây chỉ mục để soát lại (giao diện kéo thả)
-  figures/                    ← hình tách ra để nhúng vào bản dựng lại
-  report.json                 ← thống kê chất lượng + cây chỉ mục từng tài liệu
+  Quy định ABC_formalized.pdf   ← the clean file to load into RAG
+  Quy định ABC.jsonl            ← chunks for embedding
+  Quy định ABC.outline.txt      ← the outline tree, for review
+  figures/                      ← figures extracted for embedding into the rebuild
+  report.json                   ← per-document quality stats and outline
 ```
 
-## Cây chỉ mục — phần quan trọng nhất
+> **Note on language.** The tool's code, interface and documentation are in
+> English. Its *heading grammar* is Vietnamese, because it was built for
+> Vietnamese administrative and legal documents (`PHẦN`, `CHƯƠNG`, `ĐIỀU`,
+> `Phụ lục`, `MỤC`). Those keywords are part of the input format, not UI text.
 
-Hệ RAG dựng title của chunk từ cây chỉ mục, nên **sai một cấp ở đây là sai
-title của mọi chunk bên dưới**. Tool soát cây bằng sáu luật:
+---
 
-| Luật | Vì sao |
-|---|---|
-| Thứ bậc suy từ **ký hiệu**, không từ cấp danh sách của Word | Tài liệu thật hay khai `a) b) c)` cùng `ilvl` với `1. 2. 3.`; tin theo đó thì mục con thành mục ngang hàng với mục cha. `numFmt` (decimal / lowerLetter / upperRoman) mới nói đúng thứ bậc |
-| `I. II. III.` là cấp lớn, `(i) (ii)` là cấp sâu nhất, `i)` trơ trọi vẫn thuộc danh sách chữ cái | `I. THÔNG TIN CHUNG` đứng trên `10. Điều kiện`; còn `i)` giữa `a) b) c)…` chỉ là mục thứ 9, tách ra thành cấp riêng là đẻ thêm một tầng giả |
-| Số của đề mục phải **nối tiếp dãy đang mở** | `30 (ba mươi) ngày tuổi đến 70 tuổi…` là câu văn bị PDF cắt dòng, không phải mục 30. Nhận nhầm thì mọi mục thật phía sau tụt xuống làm con của nó |
-| Số đệm 0 (`04`) là **số lượng**, không phải chỉ mục | `04 (bốn) Năm hợp đồng đầu tiên` |
-| Tên mục là phần **trước dấu hai chấm**, phần sau là nội dung | Văn bản hành chính viết liền cả câu vào dòng tiêu đề: `1.9 Hợp đồng bảo hiểm: là tất cả văn bản thể hiện sự thỏa thuận…`. Để nguyên thì cả câu bị in đậm cỡ tiêu đề và title của chunk đọc như văn xuôi |
-| **Tiêu đề lớn không đánh số** làm cấp trên cùng, khi tài liệu có từ hai cái trở lên | `TỔNG QUAN VĂN BẢN QUY ĐỊNH` rồi `QUY ĐỊNH SẢN PHẨM TIẾT KIỆM…` chia tài liệu thành hai phần lớn. Bỏ qua chúng thì `1. TIÊU ĐỀ SẢN PHẨM` của phần đầu nằm ngang hàng `Điều 1` của phần sau, và cây mất hẳn cấp trên cùng |
+## Why this exists
 
-### Tiêu đề lớn không đánh số
+Most RAG failures on institutional documents are not retrieval failures — they
+are *ingestion* failures. A document arrives as a scanned-looking PDF where the
+logo is glued to the text, the outline is invisible to any layout model, half
+the spaces are `U+00A0`, and the flowchart on page 9 has been mangled into one
+long meaningless sentence.
 
-Dấu hiệu phải hội đủ cả ba: **cỡ chữ lớn hơn hẳn nội dung**, **viết hoa gần như
-toàn bộ**, **không mang chỉ mục nào**. Công thức toán (`L = M *T *R`) cũng in
-cỡ lớn và toàn chữ hoa nên bị loại thêm bằng luật "tiêu đề là một cụm từ": phải
-có ít nhất hai từ dài từ hai chữ cái trở lên.
+`docindex` is built for a RAG stack that reads documents **by their outline
+hierarchy** (Layout Analysis → Reconstruction → Chunking), **at most 3 levels
+deep**, with a **512-token chunk ceiling**. Such a stack derives its own chunk
+boundaries from the tree it reads off the printed page. So the tool's job is to
+make that tree **impossible to misread**:
 
-Chỉ nhận khi tài liệu có **từ hai tiêu đề lớn trở lên**. Đúng một cái thì đó
-chính là tên tài liệu — vốn đã là gốc của cây — thêm một nhánh nữa chỉ mọc thừa
-một cấp, mà cây chỉ sâu được 3 cấp.
+- headings are presented as headings — bold, sized by level, alone on their line
+  — so a DLA model labels them `title` rather than `text` or `list-item`;
+- the tree is re-derived from the section *numbers themselves*, not from Word's
+  list levels, and phantom sections born from sentences that happen to start
+  with a digit are rejected;
+- the document title leads, as the root of the tree, because every chunk title
+  starts there;
+- a heading is never stranded at the foot of a page, nor split across two;
+- exotic glyphs are folded to readable letters (`𝐌𝐢` → `Mi`, `∑` → `Tổng`), and
+  vector flowcharts stay pictures instead of being mined for text;
+- output defaults to **`.pdf`**, the format a DLA model reads most reliably.
 
-Tiêu đề lớn là vách ngăn, không phải một chủ đề, nên nó **không gộp nội dung
-với mục nào**: đem nội dung của một mục có số hiệu bỏ vào một nút không có chỉ
-mục để tra cứu là mất đường tra.
+---
 
-### Cây dừng ở cấp 3
-
-Từ cấp 4 (`1.1.1.1`) trở xuống, đề mục **không còn là một nhánh** mà trở lại
-làm nội dung thường của mục cha — số mục vẫn nằm nguyên trong dòng chữ nên
-không mất thông tin đánh số. Chia nhỏ tới cấp 4 thì mỗi nút chỉ còn một hai
-câu, vector của nó gần như trống nghĩa, mà title của chunk lại dài thêm một cấp
-vô ích.
-
-### Mục quá ngắn: gộp cả nội dung lẫn chỉ mục
-
-Mục dưới `--min-tokens` (mặc định **200**) và không có mục con thì được **gộp
-với mục liền kề** — mục cha, hoặc mục anh em ngay trên *hoặc ngay dưới* nó —
-với điều kiện **kết quả vẫn ≤ 512 token, đã tính cả tiền tố mục lục** mà mọi
-chunk phải mang theo; không đủ chỗ thì vẫn để tách. Chunk một hai trăm token
-gần như không mang thông tin, gộp lại thì mất nút đó trong cây nhưng **không
-mất chữ**: dòng tiêu đề được đưa xuống thành đoạn mở đầu của phần nội dung.
-
-Cách chọn bạn gộp quyết định chất lượng:
-
-* **Xét cả hai phía.** Chỉ nhìn lên trên thì một mục ngắn nằm ngay sau một mục
-  đồ sộ mắc kẹt vĩnh viễn — `Điều 1` một trăm token đứng riêng chỉ vì phía trên
-  là `MỤC LỤC` tám trăm token, trong khi `Điều 2` ngay dưới còn thừa chỗ.
-* **Ưu tiên cân bằng.** Mỗi vòng lấy mục ngắn nhất còn lại rồi ghép nó vào
-  người hàng xóm *nhỏ hơn*, nên các mục sau khi gộp dài xấp xỉ nhau thay vì một
-  khối phình to bên cạnh mấy mẩu vụn.
-* **Lặp tới khi hết.** Một mục cha vừa nuốt hết mục con của nó lại trở thành
-  mục cụt nhánh và được xét lại; gộp một lượt duy nhất thì bỏ sót hẳn nhóm này.
-
-Ngưỡng đặt cao gần nửa trần là có chủ ý — đo trên 18 tài liệu thật:
-
-| `--min-tokens` | chunk | trung vị | chunk < 200 token |
-|---|---|---|---|
-| 60 | 1142 | 273 | 389 |
-| **200** | **890** | **402** | **121** |
-| 512 | 877 | 410 | 121 |
-
-Quá 200 thì gần như không đổi gì nữa, vì lúc đó trần 512 mới là thứ chặn lại.
-
-Mục nhỏ mà vẫn đứng riêng thì chỉ vì một trong bốn lý do: nó **còn mục con**
-(gộp là xoá mất một nhánh), **hai mục liền kề ở hai nhánh khác nhau**, **gộp
-vào sẽ vượt 512**, hoặc hàng xóm là phần mở đầu / một tiêu đề lớn. Mục cha chỉ
-có mỗi dòng tiêu đề không thành chunk rời — nó đi kèm mục con đầu tiên.
-
-Gộp hai mục ngang hàng thì **chỉ mục cộng vào nhau**:
-
-```
-1.1 Mục đích cho vay  +  1.2 Loại tiền cho vay   ->   1.1 + 1.2 Mục đích cho vay + Loại tiền cho vay
-```
-
-Giữ nguyên chỉ mục cũ thì cây nói dối — chunk mang title `1.1` nhưng bên trong
-có cả phần `1.2`, tra theo số mục sẽ không ra. Số mục luôn giữ đủ; riêng phần
-tên bị chặn ở 90 ký tự (`A + B + …`) để tiền tố của chunk không phình lên ăn
-mất ngân sách token của nội dung. Tắt cả cơ chế bằng `--keep-short-sections`.
-
-Với danh mục định nghĩa, **nội dung của mục chính là tên mục** (`12 Doanh
-nghiệp cho thuê lại lao động: Là doanh nghiệp…`). Gộp hai mục như vậy mà không
-để ý thì tên mục vừa nằm trên dòng tiêu đề vừa mở đầu phần nội dung, đọc ra
-thành lặp nguyên văn một lần nữa — nên tên riêng của mục được gỡ khỏi dòng nội
-dung đầu tiên, đúng như với một mục không gộp.
-
-Trên bộ 9 tài liệu thật, các luật soát cây loại được 8 mục ma và kéo một tài
-liệu từ 5 cấp giả về đúng cấp.
-
-Xem cây chỉ mục để đối chiếu với bản gốc:
+## Install
 
 ```bash
-python -m docindex.cli "testing file" -o output --outline
+pip install PyMuPDF python-docx tkinterdnd2
 ```
 
-Cây cũng nằm trong `report.json` (`outline`, `outline_depth`).
+Python 3.10+. `tkinterdnd2` is optional — it only adds drag and drop to the GUI.
 
-## Bố cục bản tài liệu dựng lại
+Or, from a clone:
 
-| Quy tắc | Cách làm |
-|---|---|
-| Tiêu đề tài liệu | Đứng đầu trang 1, căn giữa, 24pt in đậm — gốc của cây chỉ mục |
-| Cỡ chữ tiêu đề | Giảm dần theo cấp: `1.` 20pt → `1.1` 17pt → `1.1.1` 15pt (cây dừng ở cấp 3) |
-| Cỡ chữ nội dung | 10.5pt — luôn nhỏ hơn mọi cấp tiêu đề ít nhất 1pt |
-| Tên mục | Luôn đứng riêng một dòng, in đậm, sát lề trái, cách đoạn trên/dưới 16pt/9pt |
-| Không bịa thêm dòng tiêu đề | Mỗi dòng thừa là một nhánh giả trong cây của hệ RAG. Ngoại lệ duy nhất là hậu tố `(tiếp)` khi một mục dài quá trần token phải cắt làm nhiều phần |
-| Mục dài quá 512 token | Cắt thành nhiều phần *dài xấp xỉ nhau*, mỗi phần mở lại bằng dòng `1.2 Tên mục (tiếp)`. Hệ RAG cắt chunk theo cây chỉ mục chứ không theo trang, nên một mục bốn nghìn token sẽ thành đúng một chunk bốn nghìn token và bị khâu embedding cắt cụt |
-| Ngắt trang | Do Word/MuPDF tự quyết định. Ước lượng số dòng của tool không bao giờ khớp engine dàn trang thật, ép ngắt theo ước lượng thì trang nào tính hụt sẽ tràn và để lại một trang gần như trống |
-| Tiêu đề không đứng trơ cuối trang, không vắt qua hai trang | `.docx`: đánh cờ `keep_with_next`. `.pdf`: dựng xong **đọc lại từng trang**, thấy trang nào kết thúc bằng một dòng tiêu đề thì đánh dấu mở trang mới ngay trước nó rồi dựng lại (xem bên dưới) |
-| Hình không bị bóp nhỏ | Chỗ trống cuối trang không đủ cao thì MuPDF *co ảnh lại* cho vừa thay vì đẩy sang trang sau — một lưu đồ cao 630pt bị nén còn một phần ba và mất hết chữ trong ô. Mở trang mới trước khi đặt |
-| Dòng gạch đầu dòng | Thụt lề 18pt, treo dòng — trông đúng kiểu danh sách, không lẫn vào văn xuôi |
-| Bảng, hình | Bảng dựng lại thành bảng thật, hàng tiêu đề lặp lại ở mỗi trang và không hàng nào bị ngắt làm đôi; hình nhúng vào đúng vị trí |
+```bash
+pip install -r requirements.txt
+```
 
-Thêm `--page-per-section` nếu muốn ép **mỗi mục một trang riêng** và mỗi trang
-gọn trong 512 token (ranh giới chunk trùng ranh giới trang). Muốn giữ nguyên
-bố cục gốc như file đầu vào (chỉ gỡ logo và đầu/chân trang) thì thêm
-`--keep-layout`.
+---
 
-### Vì sao phải dựng lại vài lượt mới chặn được tiêu đề trơ
+## Usage
 
-Chỗ ngắt trang do MuPDF quyết định *sau khi* đã xếp chữ, và API đặt khối không
-nói được phần nào thật sự hiện ra trên giấy: với một hàng bảng cao hơn chỗ
-trống còn lại, nó báo đã dùng hết chỗ nhưng thực tế chỉ vẽ mỗi dòng tiêu đề rồi
-đẩy cả hàng sang trang sau. Cách duy nhất chắc chắn là **đọc lại trang vừa
-dựng**: trang nào có dòng cuối cùng là chữ cỡ tiêu đề mà bên dưới không còn gì
-thì đánh dấu khối đó, dựng lại và mở trang mới ngay trước nó.
+### GUI
 
-Đẩy một tiêu đề xuống làm mọi thứ phía dưới trôi theo và đôi khi lộ ra một tiêu
-đề trơ khác, nên vòng soát chạy tối đa 10 lượt — nhưng dừng ngay khi một lượt
-không tìm thấy chỗ nào mới, nên tài liệu bình thường chỉ tốn đúng một lượt.
-Đo trên 32 tài liệu / 526 trang: **không còn tiêu đề nào đứng trơ**.
+Double-click the **`docindex` shortcut on your Desktop**. If you do not have one
+yet, double-click `scripts/create-shortcut.bat` to create it.
 
-## Vì sao trình bày như vậy — DLA nhìn thấy gì
-
-Mô hình DLA nhìn **trang giấy**, không đọc cấu trúc file. Nhãn nó gán cho mỗi
-dòng phụ thuộc vào ba dấu hiệu hình học, nên bản dựng lại được ép đúng ba dấu
-hiệu đó:
-
-| Nhãn DLA | Dấu hiệu nó dựa vào | Tool làm gì |
-|---|---|---|
-| `title` | chữ đậm, cỡ lớn hơn hẳn nội dung, đứng riêng dòng, nhiều khoảng trắng trên/dưới | Tên tài liệu 24pt, tiêu đề in đậm 11.5–20pt theo cấp, cách đoạn 16pt/9pt, sát lề trái, không bao giờ dính nội dung viết liền phía sau |
-| `list-item` | có ký hiệu đầu mục, thụt vào so với lề, cỡ chữ bằng nội dung | Mỗi dòng gạch đầu dòng là một đoạn riêng, thụt lề 18pt |
-| `text` | đoạn căn đều, không thụt, không ký hiệu | Nội dung 10.5pt căn đều |
-| `header` / `footer` | chữ nằm sát mép trên/dưới trang | Bản dựng lại **không có** đầu/chân trang, số trang cũng bỏ luôn |
-
-Ngoài ra tiêu đề còn được đánh dấu `outlineLvl` trong `.docx`, nên bản Word
-mở ra có sẵn cây mục lục đúng cấp.
-
-## Ký tự đọc ra phải đúng là ký tự đã ghi vào
-
-Hai chỗ làm hỏng chữ mà nhìn trên giấy hoàn toàn không thấy gì bất thường.
-
-**Bảng ToUnicode trỏ nhầm sang ký tự song trùng.** Font TrueType nhúng vào PDF
-làm MuPDF dựng lại bảng ToUnicode với vài glyph trỏ sang một ký tự khác hẳn
-nhưng vẽ ra y hệt:
-
-| Ghi vào | Đọc ra | Hậu quả |
-|---|---|---|
-| dấu cách | `U+00A0` dấu cách không ngắt | chuỗi **không có lấy một dấu cách thường nào** |
-| `-` | `U+00AD` gạch nối mềm | gạch nối mềm vốn là ký tự *vô hình* |
-| `;` | `U+037E` dấu chấm hỏi Hy Lạp | mất ranh giới vế câu |
-
-Tách từ, BM25 và tokenizer phía RAG hỏng theo mà không báo lỗi. Tool sửa lại
-bảng ToUnicode sau bước rút gọn font, ngay trước khi lưu file.
-
-**Ký hiệu đặc biệt trong văn bản nguồn.** Công thức tính lãi được soạn bằng
-Equation Editor nên `Mi` thật ra nằm ở khối Mathematical Alphanumeric Symbols
-(`𝐌𝐢`), khối mà hệ RAG không có font — nó đọc ra thành `$Mi$` hoặc bỏ hẳn.
-Tool quy hết về chữ Latin thường ngay từ khâu làm sạch:
-
-| Nguồn | Thành | |
-|---|---|---|
-| `𝐌𝐢`, `𝑳`, `𝟏𝟐` | `Mi`, `L`, `12` | chữ toán học → chữ Latin (`NFKC`) |
-| `∑`, `∏`, `√` | `Tổng`, `Tích`, `căn` | đọc thành lời luôn |
-| `≤ ≥ ≠ × ÷ ± → ∗` | `<= >= != x / +/- -> *` | ký hiệu toán → dấu ASCII |
-| `– — ‐ “ ” ‘ ’ •` | `- - - " " ' ' -` | dấu câu kiểu chữ → ASCII |
-| `U+F02B`, `U+F0B7` | `+`, `-` | font Symbol của Word đẩy glyph vào vùng dùng riêng nhưng giữ nguyên vị trí mã ASCII |
-
-Vùng chữ cái của font Symbol (bảng Hy Lạp, hoạ tiết Wingdings) thì **không**
-dịch sang chữ Latin — làm vậy sẽ đẻ ra một từ không hề có trong văn bản.
-
-Đo trên 32 tài liệu / 526 trang bản dựng lại: không còn ký tự lạ nào.
-
-## Cách dùng
-
-### Giao diện kéo thả
-
-Nhảy đúp vào **shortcut `docindex` trên Desktop**. Chưa có thì tạo bằng cách
-nhảy đúp `tao-shortcut.bat`.
-
-Hoặc chạy trực tiếp `docindex-gui.bat`, hoặc:
+Or run `scripts/docindex-gui.bat`, or:
 
 ```bash
 python -m docindex.gui
 ```
 
-Kéo thả file `.pdf`/`.docx` (hoặc cả thư mục) vào ô lớn phía trên, chỉnh tuỳ
-chọn nếu cần rồi bấm **Bắt đầu xử lý**. Ô **Trần token** đặt trần cho chunk
-`.jsonl` (mặc định 512). Cửa sổ hiển thị tiến độ từng tài liệu, số chunk, độ
-sâu cây chỉ mục, token trung vị và cao nhất, số logo đã loại, số hình giữ lại
-và cảnh báo chất lượng.
+Drop `.pdf`/`.docx` files (or a whole folder) into the large area at the top,
+adjust the options, and press **Start processing**. The window reports progress
+per document: chunk count, outline depth, median and maximum tokens, logos
+dropped, figures kept, and quality warnings.
 
-#### Bảng "Làm sạch tài liệu"
+Press **View outline tree** when it finishes: that tree is what every chunk
+title is built from, so it is the thing to check against the original before you
+load anything into a knowledge base.
 
-Chọn **đúng những thứ muốn gỡ**, không phải gỡ tất hay không gỡ gì. Ô **Mức làm
-sạch** là bốn tổ hợp dựng sẵn; tick tay từng ô bên dưới thì nó tự nhảy sang
-*Tuỳ chỉnh*. Dòng chữ nhỏ cuối bảng luôn ghi rõ lần chạy này sẽ gỡ những gì.
+A bad file does not stop the batch — the rest keeps going and the error is
+logged.
 
-| Mức làm sạch | Gỡ những gì |
+#### The "Document cleaning" panel
+
+Pick **exactly what you want stripped**, rather than all-or-nothing. The
+**Cleaning level** dropdown holds four presets; ticking a box by hand switches it
+to *Custom*. The small line at the bottom always spells out what this run will
+strip.
+
+| Cleaning level | What it strips |
 |---|---|
-| **Chỉ gỡ logo và ảnh bìa** (mặc định) | Logo, hoạ tiết lặp, ảnh nền, ảnh bìa trang đầu. Chữ nằm y nguyên chỗ cũ, bố cục gốc giữ nguyên |
-| Gỡ thêm đầu/chân trang | Như trên, cộng chữ ở đầu trang và chân trang |
-| Làm sạch toàn bộ, giữ bố cục | Như trên, cộng phần mục lục và trang chỉ còn mục lục |
-| Dựng lại bố cục cho RAG | Dựng lại tài liệu từ cây chỉ mục — bỏ hết logo, đầu/chân trang, mục lục |
+| **Logo and cover art only** (default) | Logos, repeated ornaments, background images, first-page cover art. Text stays exactly where it was; the original layout is untouched |
+| Also headers and footers | The above, plus header and footer text |
+| Full clean, keep layout | The above, plus the table of contents and TOC-only pages |
+| Rebuild layout for RAG | Rebuilds the document from the outline — no logos, headers, footers or TOC |
 
-Bốn ô **Gỡ logo và hoạ tiết lặp** / **Gỡ ảnh bìa ở trang đầu** / **Gỡ chữ đầu
-trang – chân trang** / **Gỡ phần mục lục** bật tắt được riêng lẻ. Hình minh hoạ
-trong thân bài không bao giờ bị gỡ, dù chọn mức nào.
+Ticking **Rebuild the layout for a RAG stack** greys out the four strip boxes:
+the content then comes from the extracted outline, where those were already
+dropped, so there is nothing left to control. Only **Strip cover art** still
+applies. **Rebuilt document format** (default `.pdf`) and **One page per
+section** are available in this mode only.
 
-Tick **Dựng lại bố cục cho hệ RAG đọc cây chỉ mục** để đổi sang lối dựng lại; khi
-đó bốn ô trên mờ đi vì nội dung lấy từ cây mục lục đã trích xuất nên chúng
-không còn gì để điều khiển, chỉ còn **Gỡ ảnh bìa** là vẫn có tác dụng. Ô **Định
-dạng bản dựng lại** (mặc định `.pdf`) và **Mỗi mục một trang riêng** chỉ dùng
-được ở lối này.
-
-Xong thì bấm **Xem cây chỉ mục** để soát lại thứ bậc đề mục của từng tài liệu
-ngay trong cửa sổ — đây là thứ cần đối chiếu với bản gốc trước khi nạp tri
-thức, vì title của mọi chunk dựng từ cây này. Cây cũng được ghi ra
-`<tên tài liệu>.outline.txt` trong thư mục kết quả. Bấm **Mở thư mục kết quả**
-để lấy file.
-
-Một file lỗi không làm dừng cả lô — phần còn lại vẫn chạy tiếp và lỗi được ghi
-rõ trong nhật ký.
-
-Kéo thả cần thư viện `tkinterdnd2`. Thiếu nó thì ô thả đổi màu và ghi rõ là
-chưa dùng được — giao diện vẫn chạy bình thường qua nút **Chọn file…** /
-**Chọn thư mục…**. Bật lại kéo thả:
+Drag and drop needs `tkinterdnd2`. Without it, the drop area changes colour and
+says so plainly — the GUI still works through **Choose files…** / **Choose
+folder…**. To enable it:
 
 ```bash
 pip install tkinterdnd2
 ```
 
-Cài xong phải **đóng và mở lại** giao diện thì mới có tác dụng. Nếu bạn mở
-bằng shortcut trên Desktop, hãy cài vào đúng Python mà shortcut dùng — bấm
-chuột phải shortcut → *Properties* để xem đường dẫn ở ô *Target*.
+Close and reopen the GUI afterwards. If you launch from the Desktop shortcut,
+install into the Python that shortcut uses (right-click → *Properties* → the
+*Target* field).
 
-### Dòng lệnh
-
-```bash
-python -m docindex.cli "testing file" -o output
-```
-
-Xử lý một file:
+### Command line
 
 ```bash
-python -m docindex.cli "testing file/Quy dinh.docx" -o output
+python -m docindex.cli "input folder" -o output
 ```
 
-Gộp tất cả tài liệu vào một file duy nhất:
+One file:
 
 ```bash
-python -m docindex.cli "testing file" -o output --merge
+python -m docindex.cli "input folder/Quy dinh.docx" -o output
 ```
 
-Kết quả: mỗi tài liệu một file `.jsonl` (một chunk mỗi dòng) và `report.json`
-tổng hợp thống kê chất lượng.
+Every document merged into a single chunk file:
 
-### Tuỳ chọn
+```bash
+python -m docindex.cli "input folder" -o output --merge
+```
 
-| Tham số | Mặc định | Ý nghĩa |
+Print each document's outline tree to check against the original:
+
+```bash
+python -m docindex.cli "input folder" -o output --outline
+```
+
+Strip **only the logo and cover art**, leaving the text exactly in place:
+
+```bash
+python -m docindex.cli doc.pdf -o output --keep-layout --keep-header-footer --keep-toc --no-jsonl
+```
+
+### Options
+
+| Flag | Default | Meaning |
 |---|---|---|
-| `--max-tokens` | 512 | Trần token của một chunk, đã trừ tiền tố mục lục (và của một trang khi bật `--page-per-section`) |
-| `--min-tokens` | 200 | Dưới ngưỡng này thì mục/chunk được gộp với mục liền trước |
-| `--keep-short-sections` | tắt | Giữ nguyên mục quá ngắn, không gộp |
-| `--overlap` | 1 | Số câu lặp lại khi một mục bị cắt ngang trang (0 = tắt) |
-| `--no-prefix` | tắt | Không chèn đường dẫn mục lục vào nội dung chunk |
-| `--path-depth` | 4 | Số cấp mục lục đưa vào tiền tố |
-| `--format` | pdf | Định dạng bản dựng lại: `pdf`, `docx`, `same` (giống file gốc) |
-| `--page-per-section` | tắt | Mỗi mục một trang riêng, mỗi trang ≤ `--max-tokens` |
-| `--outline` | tắt | In cây chỉ mục từng tài liệu để đối chiếu với bản gốc |
-| `--keep-layout` | tắt | Giữ nguyên bố cục gốc thay vì dựng lại tài liệu |
-| `--merge` | tắt | Gộp mọi tài liệu vào `chunks.jsonl` |
-| `--preview N` | 0 | In thử N chunk đầu mỗi tài liệu |
-| `--no-clean` | tắt | Không xuất bản tài liệu đã làm sạch |
-| `--no-jsonl` | tắt | Chỉ làm sạch tài liệu, không tạo chunk |
-| `--keep-cover` | tắt | Giữ lại hình bìa ở trang đầu |
-| `--keep-logo` | tắt | Giữ lại logo và hoạ tiết lặp (chỉ có tác dụng với `--keep-layout`) |
-| `--keep-header-footer` | tắt | Giữ nguyên chữ đầu trang / chân trang (chỉ với `--keep-layout`) |
-| `--keep-toc` | tắt | Giữ nguyên phần mục lục (chỉ với `--keep-layout`) |
-| `--extract-figures` | tắt | Tách hình ra PNG (bản dựng lại luôn tự tách để nhúng hình) |
+| `--max-tokens` | 512 | Token ceiling of one chunk, outline prefix already deducted (and of one page under `--page-per-section`) |
+| `--min-tokens` | 200 | Below this, a section is merged into a neighbour |
+| `--keep-short-sections` | off | Keep short sections instead of merging them |
+| `--overlap` | 1 | Sentences repeated when a section is split across pages (0 = off) |
+| `--no-prefix` | off | Do not prepend the outline path to the chunk text |
+| `--path-depth` | 4 | Outline levels kept in the prefix |
+| `--format` | pdf | Rebuild format: `pdf`, `docx`, `same` (as the source) |
+| `--page-per-section` | off | One page per section, each page ≤ `--max-tokens` |
+| `--outline` | off | Print each document's outline tree |
+| `--keep-layout` | off | Keep the original layout instead of rebuilding |
+| `--merge` | off | Merge every document into `chunks.jsonl` |
+| `--preview N` | 0 | Print the first N chunks of each document |
+| `--no-clean` | off | Do not write the cleaned document |
+| `--no-jsonl` | off | Only clean the document, produce no chunks |
+| `--keep-cover` | off | Keep the cover image on the first page |
+| `--keep-logo` | off | Keep logos and repeated ornaments (only with `--keep-layout`) |
+| `--keep-header-footer` | off | Keep header/footer text (only with `--keep-layout`) |
+| `--keep-toc` | off | Keep the table of contents (only with `--keep-layout`) |
+| `--extract-figures` | off | Export figures as PNG (the rebuild always does this anyway) |
 
-Bốn tham số `--keep-*` cho phép chọn riêng từng thứ cần gỡ khi giữ bố cục gốc.
-Ví dụ **chỉ gỡ logo và ảnh bìa**, chữ để nguyên chỗ cũ:
+---
 
-```bash
-python -m docindex.cli tai-lieu.pdf -o output --keep-layout --keep-header-footer --keep-toc --no-jsonl
+## The outline tree — the part that matters most
+
+A RAG stack builds every chunk title from the outline, so **one wrong level here
+is a wrong title on every chunk below it.** Six rules govern the tree:
+
+| Rule | Why |
+|---|---|
+| Hierarchy comes from the **marker**, not Word's list level | Real documents routinely declare `a) b) c)` at the same `ilvl` as `1. 2. 3.`; trust that and a child becomes a sibling of its parent. Only `numFmt` (decimal / lowerLetter / upperRoman) states the true hierarchy |
+| `I. II. III.` is a high level, `(i) (ii)` the deepest, a bare `i)` stays inside the letter list | `I. THÔNG TIN CHUNG` ranks above `10. Điều kiện`; an `i)` among `a) b) c)…` is just item nine, and splitting it out invents a tier |
+| A heading's number must **continue the open sequence** | `30 (ba mươi) ngày tuổi đến 70 tuổi…` is prose the PDF wrapped, not section 30. Accept it and every real section after it drops down to become its child |
+| A zero-padded number (`04`) is a **quantity**, not a section number | `04 (bốn) Năm hợp đồng đầu tiên` |
+| The name is the part **before the colon**; the rest is content | Administrative documents run whole sentences into the heading line. Left alone, the sentence is set in bold at heading size and the chunk title reads like prose |
+| **Unnumbered banner headings** become the top level, when a document has two or more | Two banners divide a document into two major parts. Miss them and the first part's `1. …` sits level with the second part's `Điều 1`, and the tree loses its top level |
+
+The full spec, with every threshold and its justification, is in
+**[docs/NORMALIZATION-RULES.md](docs/NORMALIZATION-RULES.md)**.
+
+Across a corpus of 9 real documents, these rules eliminated 8 phantom sections
+and pulled one document back from 5 spurious levels to its true depth.
+
+### The tree stops at level 3
+
+From level 4 (`1.1.1.1`) down, a heading **stops being a branch** and returns to
+being ordinary content of its parent — the number stays in the text, so no
+numbering information is lost. Split that far and each node holds one or two
+sentences: its vector is near-meaningless, and the chunk title grows a useless
+level.
+
+### Short sections: content *and* numbers are merged
+
+A section under `--min-tokens` (default **200**) with no children is **merged
+with a neighbour** — its parent, or the sibling immediately above *or below* —
+provided the result still fits in 512 tokens **including the outline prefix**
+every chunk carries. If there is no room, they stay apart. A chunk of one or two
+hundred tokens carries almost nothing; merging loses that node from the tree but
+**loses no words**: the heading line moves down to open the body.
+
+How the partner is chosen decides the quality:
+
+- **Look both ways.** Looking only backwards strands a short section forever
+  behind a huge one — a hundred-token `Điều 1` standing alone only because an
+  eight-hundred-token `MỤC LỤC` precedes it, while `Điều 2` just below has room.
+- **Prefer balance.** Each round takes the shortest remaining section and joins
+  it to its *smaller* neighbour, so merged sections come out roughly equal
+  instead of one bloated block beside a handful of scraps.
+- **Repeat until dry.** A parent that has just absorbed all its children becomes
+  a leaf itself and is reconsidered; a single-pass merge misses that case
+  entirely.
+
+The threshold sits deliberately close to half the ceiling — measured over 18 real
+documents:
+
+| `--min-tokens` | chunks | median | chunks < 200 tokens |
+|---|---|---|---|
+| 60 | 1142 | 273 | 389 |
+| **200** | **890** | **402** | **121** |
+| 512 | 877 | 410 | 121 |
+
+Past 200 almost nothing changes, because by then the 512 ceiling is what binds.
+
+A small section still standing alone means one of four things: it **has
+children** (merging would delete a branch), the **two neighbours are in different
+branches**, **merging would exceed 512**, or the neighbour is the preamble or a
+banner. A parent holding nothing but its heading line never becomes a chunk of
+its own — it travels with its first child.
+
+Merging two siblings **adds up their numbers**:
+
+```
+1.1 Mục đích cho vay  +  1.2 Loại tiền cho vay   ->   1.1 + 1.2 Mục đích cho vay + Loại tiền cho vay
 ```
 
-## Chunk trông như thế nào
+Keeping the old number alone would make the tree lie — a chunk titled `1.1` that
+also holds `1.2`, invisible to a lookup by number. Numbers are always kept in
+full; names are capped at 90 characters (`A + B + …`) so the chunk prefix does
+not eat the content's token budget. Disable the whole mechanism with
+`--keep-short-sections`.
+
+For a glossary, **the content *is* the section name** (`12 Doanh nghiệp cho thuê
+lại lao động: Là doanh nghiệp…`). Merge two of those carelessly and the name
+appears both on the heading line and at the start of the body, reading as a
+verbatim repetition — so the section's own name is stripped from the first body
+line, exactly as for an unmerged section.
+
+---
+
+## The rebuilt layout
+
+| Rule | How |
+|---|---|
+| Document title | Top of page 1, centred, 24pt bold — the root of the outline |
+| Heading sizes | Shrinking by level: `1.` 20pt → `1.1` 17pt → `1.1.1` 15pt (the tree stops at 3) |
+| Body size | 10.5pt — always at least 1pt below every heading level |
+| Section names | Always alone on their line, bold, flush left, 16pt/9pt space above/below |
+| No invented headings | Every extra line is a phantom branch. The one exception is the `(tiếp)` suffix, when a section over the token ceiling must be split |
+| Sections over 512 tokens | Split into *roughly equal* parts, each reopening with `1.2 Section name (tiếp)`. A RAG stack chunks by the outline rather than by page, so a four-thousand-token section would otherwise become one four-thousand-token chunk and get truncated |
+| Page breaks | Left to Word/MuPDF. The tool's line estimate never matches a real layout engine; forcing breaks from the estimate makes undercounted pages overflow and leaves a nearly blank page behind |
+| No stranded or split headings | `.docx`: set `keep_with_next`. `.pdf`: after rendering, **read every page back** — where a page ends on a heading line, mark it and rebuild with a page break just before (see below) |
+| Figures are never squashed | When the gap at the foot of a page is too short, MuPDF *shrinks the image* to fit rather than pushing it over — a 630pt flowchart squeezed to a third with unreadable box labels. Open a new page before placing it |
+| Bullet lines | 18pt indent, hanging — reads as a list, not as prose |
+| Tables and figures | Tables are rebuilt as real tables, the header row repeats on every page, no row is split in half; figures are embedded in place |
+
+Add `--page-per-section` to force **one page per section**, each page within 512
+tokens (chunk boundaries then coincide with page boundaries). To keep the input
+file's original layout and only strip logos and headers/footers, add
+`--keep-layout`.
+
+### Why the PDF is rendered more than once
+
+MuPDF decides page breaks *after* laying out the text, and the block-placement
+API cannot report what actually appeared on the page: given a table row taller
+than the remaining gap, it reports the space as used while in fact drawing
+nothing but the heading line and pushing the row to the next page. The only
+reliable check is to **read the rendered page back**: where the last line on a
+page is at heading size with nothing below it, mark that block, rebuild, and open
+a new page just before it.
+
+Pushing one heading down shifts everything below it and sometimes exposes another
+stranded heading, so the pass runs up to 10 times — but stops as soon as a pass
+finds nothing new, so an ordinary document costs exactly one. Measured over 32
+documents / 526 pages: **no stranded headings remain.**
+
+---
+
+## What a DLA model actually sees
+
+A layout-analysis model looks at the **printed page**; it does not read file
+structure. The label it assigns each line depends on three geometric cues, so
+the rebuild is forced to satisfy exactly those three:
+
+| DLA label | The cues it uses | What the tool does |
+|---|---|---|
+| `title` | bold, clearly larger than body, alone on its line, generous whitespace above and below | Document title 24pt, headings bold 11.5–20pt by level, 16pt/9pt spacing, flush left, never with content run into them |
+| `list-item` | opens with a bullet marker, indented, at body size | Every bullet line is its own paragraph, indented 18pt |
+| `text` | justified paragraph, no indent, no marker | Body 10.5pt, justified |
+| `header` / `footer` | text hugging the top or bottom edge | The rebuild **has no** headers or footers; page numbers are dropped too |
+
+Headings additionally carry `outlineLvl` in `.docx`, so a Word export already
+has a correctly levelled bookmark tree.
+
+---
+
+## Characters read back must be the characters written in
+
+Two failure modes corrupt text while looking perfectly fine on paper.
+
+**The ToUnicode table maps glyphs to their twins.** A TrueType font embedded in
+a PDF makes MuPDF rebuild the ToUnicode table with several glyphs pointing at a
+completely different character that draws identically:
+
+| Written | Read back | Consequence |
+|---|---|---|
+| space | `U+00A0` non-breaking space | the string contains **not one ordinary space** |
+| `-` | `U+00AD` soft hyphen | the soft hyphen is an *invisible* character |
+| `;` | `U+037E` Greek question mark | clause boundaries disappear |
+
+Word segmentation, BM25 and the downstream tokenizer all break, and none of them
+report an error. The tool repairs the ToUnicode table after font subsetting,
+right before saving.
+
+**Exotic symbols in the source.** Interest formulas are typed in Equation
+Editor, so `Mi` really lives in the Mathematical Alphanumeric Symbols block
+(`𝐌𝐢`) — a block a RAG stack has no font for, so it reads `$Mi$` or drops it
+entirely. Everything is folded to plain Latin during cleaning:
+
+| Source | Becomes | |
+|---|---|---|
+| `𝐌𝐢`, `𝑳`, `𝟏𝟐` | `Mi`, `L`, `12` | mathematical letters → Latin (`NFKC`) |
+| `∑`, `∏`, `√` | `Tổng`, `Tích`, `căn` | spelled out as words |
+| `≤ ≥ ≠ × ÷ ± → ∗` | `<= >= != x / +/- -> *` | maths symbols → ASCII |
+| `– — ‐ “ ” ‘ ’ •` | `- - - " " ' ' -` | typographic punctuation → ASCII |
+| `U+F02B`, `U+F0B7` | `+`, `-` | Word's Symbol font pushes glyphs into the PUA while keeping their ASCII code positions |
+
+The Symbol font's *letter* range (Greek alphabet, Wingdings ornaments) is **not**
+folded to Latin — doing so would invent a word that is nowhere in the document.
+
+Measured over 32 rebuilt documents / 526 pages: no exotic characters remain.
+
+---
+
+## Noise removal and figure preservation
+
+Logos and footers are pure noise — in a chunk they only dilute the vector.
+Charts and diagrams are the opposite: real content, and you need to know which
+section carries one.
+
+The two are told apart by measurable cues:
+
+| Classified as **logo** (dropped) | Classified as **figure** (kept) |
+|---|---|
+| The same image on 2 or more pages | Appears once |
+| Shortest side < 70px, or < 2.5% of the page area | Large enough, inside the content area |
+| Sits in the top/bottom margin | Sits in the middle of the page |
+| Covers the page while the page still holds plenty of text (background) | — |
+| No dark ink at all (watermark) | Has ink dark enough to read |
+| The page's live text sits on top of it (frame, colour band) | Its text lives inside the image file |
+| Tens of thousands of colours (marketing photograph) | A few hundred (line art, flat fills) |
+
+A cover page is usually empty once stripped — it was never more than one image —
+so that blank page is dropped entirely rather than left as a white sheet.
+
+### Watermarks slip through every size threshold
+
+The faint hand-holding-a-shield, the leaf, the globe printed across the middle of
+the page: half a page wide, so every size threshold clears it, and printed only
+once, so the repeat count misses it too. Four of the cues above fail, and it
+walks straight into a chunk as a genuine figure.
+
+The remaining cue is elsewhere: a watermark has to stay faint for the text on top
+to remain readable, so it carries **no dark ink at all**. A chart or flowchart is
+the opposite — without dark ink it is unreadable itself. The tool re-reads the
+image area exactly as the eye sees it on the page (transparency composited over
+the paper) and counts pixels darker than grey level 170:
+
+| | Dark pixel ratio |
+|---|---|
+| Watermark | 0.00 – 0.02 |
+| Every content figure in the real corpus | 0.17 – 0.68 |
+
+The threshold sits at **0.05**, at least 3× from either side — and a test holds
+that gap open, so the next tweak to the number cannot silently drop a pale chart.
+An image with a caption ("Hình 3: …") skips the measurement entirely: the author
+has already declared it content.
+
+### Frames and photographs: dark ink, still decoration
+
+The ink measure divides by the number of *non-paper* pixels, so a rounded red
+frame drawn around a paragraph — a few red strokes on a transparent ground —
+scores **0.67**, level with the densest diagram. The fan-shaped family collage on
+a part's cover page does the same. Both walk into the clean document as content.
+
+Two further cues separate them:
+
+| | The page's live text on top | Colours (rendered at 48 dpi) |
+|---|---|---|
+| Frames and colour bands under text | 292 – 523 characters | 758 – 1,229 |
+| Marketing photographs | 0 – 523 characters | 39,832 – 48,968 |
+| **Content diagrams and charts** | **0 characters** | **610 – 621** |
+
+A frame is drawn *under* the text, so the page's text sits on it; a diagram's
+labels live inside its own image file, and that area holds no live characters at
+all. Photographs have continuous gradients while diagrams use flat colour areas —
+the threshold sits at **8,000 colours**, 6.5× below the upper group and 5× above
+the lower.
+
+A scanned page is also one photograph of the whole sheet: it fails the tests, and
+dropping it loses the content entirely. So a page with fewer than 200 live
+characters has its images **exempted from measurement** — the image *is* the
+page's content. Captioned images are exempt from both tests.
+
+Measured over 6 insurance documents: these two rules removed **19 further
+decorative images** without touching a single content diagram, across 38 scanned
+pages.
+
+### Headers and footers repeat **in exactly one spot**
+
+Not every document's footer hugs the bottom — some place the page number at 81%
+of the page height, above any reasonable footer mark. Widening the scan band
+alone drags real content in with it (a `Trang 5` cell in a table of contents, for
+instance).
+
+So the rule is: **repeats on most pages *and* appears at exactly the same
+coordinate every time.** The first condition alone is not enough — a frequently
+repeated cross-reference satisfies it too — but adding the second leaves only
+what was actually placed in the header/footer frame. Page numbers differ on every
+page, but with digits erased `1/5` and `2/5` fold to one string and are caught
+anyway.
+
+### Figures in the chunk file
+
+In the rebuilt document, figures are embedded back at their place in the flow of
+their section; logos, cover art and headers/footers are not carried over. A
+figure taller than one page is scaled to fit.
+
+In the **chunk file**, a figure becomes a placeholder line:
+
+```
+[FIGURE: Biểu đồ 1: Cơ cấu quyền lợi | 325x324 | tailieu_p3_1.png]
+```
+
+plus a `has_figure` flag and a `figures` list (size, caption, file path) in the
+metadata. At query time you therefore know the section carries an image you can
+display alongside the answer, or hand to a vision model.
+
+Captions are recognised from the usual patterns: `Hình 1:`, `Biểu đồ 2 -`,
+`Sơ đồ 3.`, `Figure 4:` …
+
+With `--keep-layout`, images are removed by their own reference id, never by
+area. Logos often sit on top of a large figure, and area-based redaction would
+take the content with them.
+
+In DOCX, logos usually live in the header/footer — outside the document body, so
+they never reach a chunk in the first place.
+
+### Vector flowcharts
+
+A process flowchart in a PDF is not an image: it is a mass of vector strokes plus
+the text inside each box. Ordinary extraction pulls all that text out and lays it
+in one long meaningless line — *the diagram disappears and only scattered words
+remain*:
+
+```
+| Nội dung Mẫu ĐVKD lưu Đại ký lưu ký lưu Tiếp nhận và khai báo Kiểm tra, đối chiếu danh sách …
+```
+
+Tables are drawn with strokes too, so the two must be told apart. The difference:
+table rules are always horizontal or vertical, while a flowchart has **diagonal
+strokes** (arrows, the sides of a diamond) and **curves** (ellipses, rounded
+corners). Measured on real documents, a table page has exactly 0 such strokes and
+a flowchart page has dozens.
+
+Any region with 6 or more diagonal/curved strokes is exported as a PNG and
+embedded back into the rebuild, and the text inside that region is dropped —
+it is already in the image. If the image cannot be exported (no figure directory
+given), the text is kept: jumbled text beats losing the block entirely.
+
+### Scans: nothing can be stripped, and the tool says so
+
+A scanned page is **one photograph of the whole sheet**: text, logo, headers,
+footers and table of contents are all pixels inside a single image. There is no
+separate object to strip, and stripping that image leaves a blank page. The
+chunks would hold nothing but a `[FIGURE: …]` placeholder, and the outline would
+be empty — loading that into RAG is pointless.
+
+The tool used to run quietly and produce a 6.6 MB file that looked like success.
+Now any document where **80% or more of its pages have no text layer** is flagged
+at extraction time, in both the GUI and the CLI:
+
+```
+[!] 21/21 pages have no text layer — this is a scan. Text and logo share a
+    single full-page image, so the logo cannot be stripped on its own and the
+    chunks hold nothing but [FIGURE] placeholders. Run OCR (or fetch the
+    original .docx/.pdf) and feed it back in.
+```
+
+The warning appears **before** cleaning, so you do not wait for a whole batch to
+find out. `report.json` records `pages_total` / `pages_without_text` for
+cross-checking.
+
+---
+
+## What a chunk looks like
 
 ```json
 {
@@ -366,19 +565,21 @@ python -m docindex.cli tai-lieu.pdf -o output --keep-layout --keep-header-footer
 }
 ```
 
-- `text` — dùng để tính vector (đã gắn sẵn đường dẫn mục lục ở đầu).
-- `est_tokens` — số token ước lượng của `text`, luôn ≤ `--max-tokens`. Ước
-  lượng lấy mức **cao hơn** thực tế (2.8 ký tự/token, có tính dấu câu), vì đếm
-  thiếu thì chunk lọt qua mọi kiểm tra rồi mới bị cắt cụt ở khâu embedding.
-- `raw_text` — nội dung gốc, dùng để hiển thị cho người đọc.
-- `page_source` — `actual` (PDF, trang thật) hoặc `rendered`/`page_break`/
-  `estimated` với DOCX, do file Word không lưu sẵn số trang.
+- `text` — what you embed (the outline path is already prepended).
+- `est_tokens` — the estimated token count of `text`, always ≤ `--max-tokens`.
+  The estimate deliberately runs **high** (2.8 chars/token, punctuation counted),
+  because an undercount passes every check here and is only truncated later, at
+  embedding time.
+- `raw_text` — the original content, for display to a reader.
+- `page_source` — `actual` (PDF, real page numbers) or
+  `rendered`/`page_break`/`estimated` for DOCX, since Word files do not store
+  page numbers.
 
-## Lấy đủ ngữ cảnh khi truy vấn
+### Recovering full context at query time
 
-Chunk nhỏ giúp tìm kiếm chính xác, nhưng câu trả lời cần nội dung đầy đủ của
-mục. Khi chunk khớp truy vấn có `is_continued` hoặc `is_continuation` bằng
-`true`, hãy ghép các phần còn lại của cùng mục:
+Small chunks make retrieval precise, but an answer needs the section's full
+content. When a matching chunk has `is_continued` or `is_continuation` set to
+`true`, reassemble the rest of its section:
 
 ```python
 from docindex.retrieval import load_chunks, index_by_id, expand_section
@@ -386,238 +587,110 @@ from docindex.retrieval import load_chunks, index_by_id, expand_section
 chunks = load_chunks("output/chunks.jsonl")
 by_id = index_by_id(chunks)
 
-hit = chunks[30]                      # chunk do vector search trả về
-context = expand_section(hit, by_id)  # nội dung đầy đủ của mục đó
+hit = chunks[30]                      # a chunk returned by vector search
+context = expand_section(hit, by_id)  # the section's full content
 ```
 
-## Tool xử lý những gì
+---
 
-| Vấn đề | Cách xử lý |
+## Problems handled
+
+| Problem | How it is handled |
 |---|---|
-| Word đánh số tự động, chỉ mục không nằm trong text | Dựng lại số mục từ `numbering.xml` theo chuẩn OOXML |
-| Word khai `a) b) c)` ngang cấp với `1. 2. 3.` | Xếp thứ bậc theo loại ký hiệu (`numFmt`), không theo cấp danh sách |
-| Câu văn mở đầu bằng số bị nhận thành đề mục | Đối chiếu với dãy chỉ mục đang mở, không nối tiếp được thì loại |
-| Đề mục sâu quá cấp 3 (`1.1.1.1`) | Không vào cây nữa, trở lại làm nội dung thường của mục cha — số mục giữ nguyên trong dòng chữ |
-| Header/footer lặp ở mọi trang | Nhận diện dòng lặp trên ≥50% số trang rồi loại bỏ |
-| Trang mục lục sinh chunk rác | Bỏ trang có nhiều dòng dấu chấm dẫn |
-| Một mục trải nhiều trang | Cắt theo trang, giữ đường dẫn mục lục + cờ `is_continued` + prev/next |
-| Một trang chứa nhiều mục | Tách thành nhiều chunk, không trộn hai chủ đề |
-| Mục quá ngắn (chỉ có tiêu đề) | Gộp với mục con/anh em cùng trang |
-| Mục quá dài | Cắt tại ranh giới câu, bảng cắt theo hàng và lặp lại dòng tiêu đề |
-| Bảng trải nhiều trang | Trích thành markdown, tính đúng số trang bị ngắt |
-| PDF tách ký hiệu đầu mục ra cột riêng | Gộp lại theo hàng ngang |
-| PDF lưu từng dòng hiển thị | Nối lại thành đoạn văn hoàn chỉnh; câu còn dở ở cuối khối được nối với khối sau |
-| Từ bị gạch nối cắt đôi cuối dòng (`…và Dai-` / `ichi Life…`) | Nối liền lại, kể cả khi hai dòng khác kiểu chữ |
-| Câu dẫn chiếu "…tại Điều 2.3 Phần 1 này" | Không nhận nhầm thành tiêu đề |
-| Logo, hoạ tiết, ảnh nền trang trí | Loại bỏ hoàn toàn, không đưa vào chunk |
-| Hoa văn chìm to bằng nửa trang | Nhận ra vì không có lấy một nét đậm nào — xem [Hoa văn chìm](#hoa-văn-chìm-không-lọt-được-lưới-kích-thước) |
-| Biểu đồ, sơ đồ minh hoạ | Giữ chỗ bằng dòng `[HÌNH: …]` + metadata, tách PNG được |
-| Số trang "9/34", "Lưu hành nội bộ" | Loại theo mẫu câu và theo mức độ lặp giữa các trang |
-| Bìa và mục lục nằm chung một trang | Chỉ cắt phần mục lục, giữ nguyên nội dung bìa |
-| Ô gộp tạo cột rỗng trong bảng | Lược bỏ cột rỗng khi dựng bảng markdown |
-| Hàng bảng dài quá trần chunk | Chuyển sang dạng "tên cột: giá trị", không cắt vỡ bảng |
-| Bảng một ô gộp trải cả trang | Nhận ra đây là khung văn bản, trả về nguyên văn rồi cắt theo câu — không thì cả khối vượt trần token |
-| Dấu cách trong PDF thành `U+00A0` | Sửa bảng ToUnicode để đọc lại ra dấu cách thường |
-| Tiêu đề viết liền cả nội dung | Rút gọn cho đường dẫn, nội dung vẫn giữ đủ chữ |
-| File nguồn rơi ký tự khi tạo PDF | Cảnh báo trong báo cáo để bạn lấy lại bản gốc |
+| Word auto-numbering: the number is not in the text | Rebuilt from `numbering.xml` per the OOXML rules |
+| Word declares `a) b) c)` level with `1. 2. 3.` | Hierarchy from the marker kind (`numFmt`), not the list level |
+| A sentence starting with a number read as a heading | Checked against the open number sequence; rejected if it does not continue it |
+| Headings deeper than level 3 (`1.1.1.1`) | Leave the tree and become content of the parent — the number stays in the text |
+| Headers/footers repeating on every page | Detected as lines repeating on ≥50% of pages at one coordinate, then removed |
+| TOC pages producing junk chunks | Pages with many dot-leader lines are dropped |
+| A section spanning several pages | Split by page, keeping the outline path, the `is_continued` flag and prev/next links |
+| A page holding several sections | Split into several chunks, never mixing two topics |
+| A section too short (heading only) | Merged with a child or sibling on the same page |
+| A section too long | Split at sentence boundaries; tables split by row with the header repeated |
+| A table spanning pages | Extracted as markdown, with the page count computed correctly |
+| PDF putting item markers in their own column | Rejoined by horizontal row |
+| PDF storing rendered lines | Rejoined into complete paragraphs; a sentence unfinished at a block's end joins the next |
+| A word hyphenated across lines (`…và Dai-` / `ichi Life…`) | Rejoined, even when the two lines differ in style |
+| Cross-references ("…tại Điều 2.3 Phần 1 này") | Not mistaken for headings |
+| Logos, ornaments, decorative backgrounds | Removed entirely, never reaching a chunk |
+| Watermarks half a page wide | Recognised by having no dark ink at all |
+| Charts and diagrams | Preserved with a `[FIGURE: …]` placeholder plus metadata; exportable as PNG |
+| Page numbers "9/34", "Lưu hành nội bộ" | Removed by pattern and by cross-page repetition |
+| Cover and TOC on the same page | Only the TOC part is cut; the cover content stays |
+| Merged cells creating empty columns | Empty columns dropped when building the markdown table |
+| A table row over the chunk ceiling | Converted to "column: value" lines rather than breaking the table |
+| A single merged cell spanning a page | Recognised as a text frame, returned verbatim and split by sentence — otherwise the whole block blows the ceiling |
+| Spaces in a PDF becoming `U+00A0` | ToUnicode table repaired so they read back as ordinary spaces |
+| A heading with the content run into it | Shortened for the path while the body keeps every word |
+| The source file dropped characters when the PDF was made | Flagged in the report so you can fetch the original |
 
-## Lọc nhiễu và giữ hình
+---
 
-Logo và chân trang là nhiễu thuần tuý — đưa vào chunk chỉ làm loãng vector.
-Ngược lại biểu đồ, sơ đồ là nội dung thật, cần biết mục nào có hình.
-
-Tool phân biệt hai loại bằng các dấu hiệu đo được:
-
-| Xếp là **logo** (loại bỏ) | Xếp là **hình minh hoạ** (giữ) |
-|---|---|
-| Cùng một ảnh lặp trên ≥2 trang | Chỉ xuất hiện một lần |
-| Cạnh ngắn < 70px hoặc < 2.5% diện tích trang | Đủ lớn trong vùng nội dung |
-| Nằm ở lề trên/dưới trang | Nằm giữa trang |
-| Phủ kín trang mà trang vẫn nhiều chữ (ảnh nền) | — |
-| Không có lấy một nét đậm nào (hoa văn chìm) | Có mực đậm để đọc được |
-| Chữ sống của trang nằm đè lên (khung, dải màu) | Chữ nằm sẵn trong file ảnh |
-| Hàng chục nghìn màu (ảnh chụp quảng cáo) | Vài trăm màu (nét vẽ, mảng phẳng) |
-
-Trang bìa gỡ xong thường chẳng còn gì — bìa vốn chỉ có mỗi tấm ảnh — nên trang
-rỗng đó bị bỏ hẳn thay vì để lại một tờ trắng trong bản sạch.
-
-### Bản scan: không gỡ logo được, và tool nói thẳng ra
-
-Trang scan là **một tấm ảnh chụp cả trang**: chữ, logo, đầu/chân trang, mục lục
-đều là điểm ảnh nằm chung trong đúng một tấm hình. Không có đối tượng riêng nào
-để gỡ, mà gỡ tấm hình ấy đi thì trang trắng trơn. Chunk cho ra cũng chỉ có mỗi
-dòng giữ chỗ `[HÌNH: …]`, cây chỉ mục rỗng — nạp vào RAG là vô nghĩa.
-
-Trước đây tool vẫn chạy êm và cho ra một file 6.6 MB trông như thành công. Giờ
-tài liệu nào có **từ 80% số trang trở lên không có lớp text** sẽ bị báo ngay từ
-lúc trích xuất, cả trong giao diện lẫn dòng lệnh:
-
-```
-[!] 21/21 trang không có lớp text — đây là bản scan. Chữ và logo nằm chung
-    trong một tấm ảnh chụp cả trang nên không gỡ riêng logo được, chunk cũng
-    chỉ có dòng giữ chỗ [HÌNH]. Chạy OCR (hoặc lấy bản .docx/.pdf gốc) rồi
-    đưa lại vào tool.
-```
-
-Cảnh báo hiện ra **trước** khâu làm sạch, nên không phải chờ hết cả lô mới biết.
-`report.json` ghi kèm `pages_total` / `pages_without_text` để đối chiếu.
-
-Trong **bản tài liệu dựng lại**, hình minh hoạ được nhúng lại đúng chỗ của nó
-trong mạch nội dung của mục; logo, hình bìa và đầu/chân trang không được đưa
-sang. Hình cao hơn một trang thì thu nhỏ cho vừa.
-
-Với `--keep-layout`, việc gỡ ảnh được thực hiện theo đúng mã tham chiếu của
-từng ảnh, không xoá theo vùng. Logo hay nằm đè lên hình minh hoạ lớn, xoá theo
-vùng sẽ cuốn mất luôn cả hình nội dung.
-
-### Hoa văn chìm: không lọt được lưới kích thước
-
-Bàn tay đỡ chiếc khiên in mờ giữa trang, chiếc lá, quả địa cầu — thứ hoa văn
-này **to bằng cả nửa trang** nên vượt mọi ngưỡng kích thước, và **chỉ in đúng
-một lần** nên phép đếm số trang lặp cũng không bắt được. Bốn dấu hiệu ở bảng
-trên đều trượt, nó đi thẳng vào chunk như một hình minh hoạ thật.
-
-Dấu hiệu còn lại nằm ở chỗ khác: hoa văn phải in mờ thì chữ đè lên mới đọc
-được, nên nó **không có lấy một nét đậm nào**. Biểu đồ hay lưu đồ thì ngược
-lại — không có mực đậm thì chính nó không đọc được. Tool đọc lại vùng ảnh đúng
-như mắt người nhìn thấy trên trang (phần trong suốt đã chồng lên nền giấy) rồi
-đếm tỉ lệ điểm ảnh đậm hơn mức xám 170:
-
-| | Tỉ lệ điểm ảnh đậm |
-|---|---|
-| Hoa văn chìm | 0.00 – 0.02 |
-| Mọi hình nội dung trong bộ tài liệu thật | 0.17 – 0.68 |
-
-Ngưỡng đặt ở **0.05**, cách cả hai bên ít nhất ba lần — có test giữ đúng khoảng
-trống này để lần đổi số sau không âm thầm gỡ mất một biểu đồ nhạt màu. Ảnh có
-chú thích ("Hình 3: …") thì bỏ qua phép đo: người soạn đã tự nhận đó là hình
-nội dung.
-
-### Khung bo góc và ảnh chụp quảng cáo: mực đậm nhưng vẫn là trang trí
-
-Phép đo mực chia cho *số điểm không phải nền giấy*, nên một khung bo góc màu đỏ
-vẽ quanh đoạn văn — chỉ có mấy nét đỏ trên nền trong suốt — chấm **0.67**, ngang
-với sơ đồ dày đặc nhất. Mảng ảnh chụp gia đình ở trang bìa từng phần cũng vậy.
-Cả hai đi thẳng vào tài liệu sạch như hình nội dung.
-
-Hai dấu hiệu khác tách được chúng ra:
-
-| | Chữ sống của trang đè lên | Số màu (dựng lại ở 48 dpi) |
-|---|---|---|
-| Khung, dải màu vẽ dưới chữ | 292 – 523 ký tự | 758 – 1 229 |
-| Ảnh chụp quảng cáo | 0 – 523 ký tự | 39 832 – 48 968 |
-| **Sơ đồ, biểu đồ nội dung** | **0 ký tự** | **610 – 621** |
-
-Khung được vẽ *dưới* chữ nên chữ của trang nằm đè lên nó; nhãn của một sơ đồ thì
-nằm sẵn trong chính file ảnh, vùng đó không có lấy một ký tự sống nào. Còn ảnh
-chụp thì chuyển sắc liên tục, sơ đồ vẽ bằng mảng màu phẳng — ngưỡng đặt ở
-**8 000 màu**, cách mép trên 6.5 lần và mép dưới 5 lần.
-
-Trang scan là một tấm ảnh chụp cả trang, đo thì rớt mà gỡ đi là mất trắng nội
-dung, nên trang nào có dưới 200 ký tự chữ sống thì ảnh của nó **không đem ra
-đo** — ảnh chính là nội dung của trang. Ảnh có chú thích vẫn được miễn cả hai
-phép đo.
-
-Đo trên 6 tài liệu bảo hiểm: hai luật này gỡ thêm **19 ảnh trang trí** mà không
-đụng tới sơ đồ nội dung nào lẫn 38 trang scan.
-
-### Đầu/chân trang: lặp lại **ở đúng một chỗ**
-
-Chân trang không phải tài liệu nào cũng nằm sát đáy — có bản đặt số trang ở 81%
-chiều cao, cao hơn mọi mốc chân trang hợp lý. Nới dải quét ra thì lại cuốn theo
-nội dung thật (ô `Trang 5` của bảng mục lục chẳng hạn).
-
-Nên luật là **lặp lại trên phần lớn số trang *và* lần nào cũng ở đúng một toạ
-độ**. Riêng điều kiện thứ nhất chưa đủ — một câu dẫn chiếu hay lặp cũng thoả —
-thêm điều kiện thứ hai vào thì chỉ còn đúng thứ được đặt trong khung đầu/chân
-trang. Số trang thì mỗi trang một khác, nhưng khi xoá hết chữ số đi thì `1/5`
-và `2/5` cùng quy về một chuỗi nên vẫn bắt được.
-
-Trong **file chunk**, hình được thay bằng một dòng giữ chỗ:
-
-```
-[HÌNH: Biểu đồ 1: Cơ cấu quyền lợi | 325x324 | tailieu_p3_1.png]
-```
-
-kèm cờ `has_figure` và danh sách `figures` (kích thước, chú thích, đường dẫn
-file) trong metadata. Nhờ vậy khi truy vấn bạn biết mục đó có hình để hiển thị
-kèm, hoặc đưa file ảnh qua mô hình đọc ảnh nếu cần.
-
-Chú thích được nhận từ các mẫu quen thuộc: `Hình 1:`, `Biểu đồ 2 -`,
-`Sơ đồ 3.`, `Figure 4:`…
-
-Với DOCX, logo thường nằm ở header/footer — vốn không thuộc phần thân tài liệu
-nên không bao giờ lọt vào chunk.
-
-### Lưu đồ vẽ bằng nét
-
-Lưu đồ quy trình trong PDF không phải ảnh: nó là một mớ nét vẽ cộng với chữ nằm
-trong từng ô. Trích xuất theo lối thường sẽ moi hết chữ ấy ra rồi xếp thành một
-dòng dài vô nghĩa — *cả sơ đồ biến mất, chỉ còn lại chữ rời rạc*:
-
-```
-| Nội dung Mẫu ĐVKD lưu Đại ký lưu ký lưu Tiếp nhận và khai báo Kiểm tra, đối chiếu danh sách …
-```
-
-Bảng cũng vẽ bằng nét nên phải phân biệt cho được. Khác nhau ở chỗ: đường kẻ
-bảng bao giờ cũng **ngang hoặc dọc**, còn lưu đồ thì có **nét chéo** (mũi tên,
-cạnh hình thoi) và **nét cong** (hình bầu dục, góc bo). Đo trên tài liệu thật,
-trang bảng có đúng 0 nét như vậy còn trang lưu đồ có vài chục.
-
-Vùng nào có từ 6 nét chéo/cong trở lên được xuất thành ảnh PNG rồi nhúng lại
-vào bản dựng lại, còn chữ bên trong vùng đó bị bỏ đi vì đã nằm sẵn trong ảnh.
-Nếu không xuất được ảnh (chạy không kèm thư mục hình) thì chữ vẫn giữ nguyên —
-thà lộn xộn còn hơn mất trắng cả khối nội dung.
-
-## Cấu trúc mã nguồn
+## Project layout
 
 ```
 docindex/
-  gui.py           giao diện kéo thả
-  cli.py           điểm vào dòng lệnh
-  export.py        xuất bản tài liệu sạch (dựng lại bố cục hoặc giữ bố cục gốc)
-  layout.py        dựng cây chỉ mục thành bố cục: cỡ chữ theo cấp, chia trang
-  render.py        ghi bố cục ra .docx / .pdf
-  pipeline.py      ghép các bước cho từng file
-  extract_pdf.py   PDF -> block (PyMuPDF)
-  extract_docx.py  DOCX -> block (python-docx)
-  numbering.py     dựng lại chỉ mục tự động của Word
-  images.py        phân loại logo / hình minh hoạ, nhận lưu đồ vẽ bằng nét, tách ảnh
-  headings.py      nhận diện tiêu đề, soát dãy chỉ mục, dựng cây mục lục
-  chunker.py       cắt chunk theo trang và theo mục
-  report.py        kiểm tra chất lượng
-  retrieval.py     mở rộng ngữ cảnh lúc truy vấn
-  models.py        kiểu dữ liệu dùng chung, chuẩn hoá ký hiệu đặc biệt
+  gui.py           drag-and-drop interface
+  cli.py           command line entry point
+  export.py        writes the cleaned document (rebuilt layout, or original layout)
+  layout.py        turns the outline into a layout: sizes by level, pagination
+  render.py        writes the layout out as .docx / .pdf
+  pipeline.py      wires the steps together for one file
+  extract_pdf.py   PDF -> blocks (PyMuPDF)
+  extract_docx.py  DOCX -> blocks (python-docx)
+  numbering.py     rebuilds Word's automatic numbering
+  images.py        logo/figure classification, vector diagrams, image export
+  headings.py      heading detection, sequence checking, outline building
+  chunker.py       splits into chunks by page and by section
+  report.py        quality checks
+  retrieval.py     context expansion at query time
+  models.py        shared data types, symbol normalization
+docs/
+  NORMALIZATION-RULES.md   the full spec, with every threshold justified
+scripts/
+  docindex-gui.bat         open the GUI
+  create-shortcut.bat/.ps1 create Desktop shortcuts (Windows)
+tests/
+  test_docindex.py         constraint tests against a real corpus
 ```
 
-## Kiểm tra chất lượng
+---
 
-`report.json` ghi lại thống kê từng tài liệu: số chunk, số tiêu đề nhận được,
-`tokens_median` / `tokens_max` so với `token_limit`, độ dài chunk, số logo đã
-loại, số hình giữ lại và các cảnh báo. `tokens_max` chạm đúng `token_limit` là
-bình thường — vượt mới là lỗi, và khi đó `too_long` khác 0 kèm cảnh báo.
+## Quality checks
 
-Đáng chú ý nhất là cảnh báo `suspect_truncated_lines`: một số PDF được tạo từ
-Word bị rơi ký tự ngay trong file gốc (ví dụ "Khách hàng" thành "h hàng").
-Tool không thể khôi phục phần đã mất, nên khi thấy cảnh báo này hãy xử lý từ
-bản `.docx` gốc nếu còn.
+`report.json` records per-document statistics: chunk count, headings detected,
+`tokens_median` / `tokens_max` against `token_limit`, chunk lengths, logos
+dropped, figures kept, and any warnings. `tokens_max` touching `token_limit`
+exactly is normal — exceeding it is a bug, and then `too_long` is non-zero with a
+warning attached.
 
-Bộ test kiểm tra các ràng buộc quan trọng trên chính tài liệu thật: không chunk
-nào vượt 512 token, không trang nào vượt 512 token, tiêu đề trong PDF phải in
-đậm và to hơn nội dung, không tiêu đề nào đứng trơ cuối trang, ký tự đọc lại
-phải đúng ký tự đã ghi vào (dấu cách, dấu gạch, chấm phẩy), lưu đồ phải còn
-nguyên dạng hình, cùng chốt chặn chống mất chữ (mọi tài liệu phải giữ ≥95% số
-từ, phần còn lại là mục lục và đầu/chân trang bị loại có chủ đích):
+The warning worth watching for is `suspect_truncated_lines`: some PDFs made from
+Word lose characters in the source file itself ("Khách hàng" becoming "h hàng").
+The tool cannot recover what is already gone, so when you see this, process the
+original `.docx` instead if you still have it.
+
+The test suite checks the important constraints against real documents: no chunk
+over 512 tokens, no page over 512 tokens, headings in the PDF bold and larger
+than the body, no stranded headings, characters reading back as they were written
+(spaces, hyphens, semicolons), flowcharts surviving as pictures, plus a backstop
+against text loss (every document must keep ≥95% of its words — the remainder is
+the TOC and headers/footers dropped on purpose):
 
 ```bash
 python -m pytest tests/ -q
 ```
 
-## Yêu cầu
+The tests skip automatically when no document corpus is present. Point
+`TEST_DIR` in `tests/test_docindex.py` at a folder of your own `.pdf`/`.docx`
+files to run them against real input.
 
-Python 3.10+, `PyMuPDF`, `python-docx`. Thêm `tkinterdnd2` nếu muốn kéo thả
-trong giao diện.
+---
 
-```bash
-pip install PyMuPDF python-docx tkinterdnd2
-```
+## Requirements
+
+Python 3.10+, `PyMuPDF`, `python-docx`. Add `tkinterdnd2` for drag and drop in
+the GUI.
+
+## License
+
+[MIT](LICENSE)

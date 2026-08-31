@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docindex"
+version = "1.0.0"
+description = "Clean PDF/DOCX documents and chunk them along their outline for a RAG pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "hungdp1", email = "dophuhung.hn@gmail.com" }]
+keywords = ["rag", "pdf", "docx", "chunking", "document-layout-analysis", "vietnamese"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Text Processing :: Markup",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "PyMuPDF>=1.24",
+    "python-docx>=1.1",
+]
+
+[project.optional-dependencies]
+gui = ["tkinterdnd2>=0.4"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+docindex = "docindex.cli:main"
+
+[project.gui-scripts]
+docindex-gui = "docindex.gui:main"
+
+[tool.setuptools]
+packages = ["docindex"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
