@@ -1,21 +1,22 @@
-"""Ghi bố cục đã dựng ra file .docx hoặc .pdf.
+"""Write the computed layout out as a .docx or .pdf file.
 
-Hai bộ ghi cùng đọc một danh sách `LayoutPage` nên hai định dạng cho ra cùng
-một bố cục: mỗi mục một trang, tiêu đề riêng dòng, cỡ chữ giảm dần theo cấp.
+Both writers read the same list of `LayoutPage` objects, so the two formats
+produce the same layout: headings alone on their line, sizes shrinking with
+depth.
 
-Cách trình bày ở đây phục vụ mô hình DLA đọc lại tài liệu. Mô hình đó nhìn
-trang giấy chứ không đọc mã nguồn, nên nhãn nó gán cho từng dòng phụ thuộc vào
-đúng ba dấu hiệu hình học:
+The presentation here exists to serve the DLA model that will read the document
+back. That model looks at the printed page rather than the file structure, so
+the label it assigns each line depends on exactly three geometric cues:
 
-* **title** — chữ đậm, cỡ lớn hơn hẳn nội dung, đứng riêng một dòng sát lề
-  trái, có khoảng trắng rộng ở trên và dưới;
-* **list-item** — dòng bắt đầu bằng ký hiệu đầu mục, thụt vào so với lề, cỡ
-  chữ bằng nội dung;
-* **text** — đoạn văn căn đều, không thụt, không ký hiệu.
+* **title** — bold, clearly larger than the body, alone on its line against the
+  left margin, with generous whitespace above and below;
+* **list-item** — a line opening with a bullet marker, indented from the
+  margin, at body font size;
+* **text** — a justified paragraph, no indent, no marker.
 
-Vì vậy tiêu đề phải được nới khoảng cách và giữ nguyên cỡ chữ theo cấp, còn
-dòng gạch đầu dòng phải thụt lề thật sự — trông giống văn bản hành chính chuẩn
-thì DLA mới dựng đúng cây phân cấp.
+Hence headings get wide spacing and keep their size-per-level, and bullet lines
+get a real indent — look like a properly formatted administrative document and
+the DLA model builds the right hierarchy.
 """
 from __future__ import annotations
 
@@ -33,30 +34,31 @@ from docx.shared import Cm, Pt
 
 from .layout import BODY_PT, LayoutPage, PageItem
 
-# Ký hiệu mở đầu một dòng danh sách trong văn bản hành chính Việt Nam
+# Markers that open a list line in Vietnamese administrative documents
 _BULLET = re.compile(r"^\s*([-–—•+*]|\(?[a-zđ]\)|\(?[ivx]+\)|\d+[.)])\s+")
 
-# Khoảng trắng quanh tiêu đề (pt). Rộng hơn khoảng cách giữa các đoạn văn để
-# DLA thấy rõ tiêu đề là một khối riêng chứ không phải dòng đầu của đoạn.
+# Whitespace around a heading, in points. Wider than the gap between paragraphs
+# so the DLA model sees the heading as its own block, not the first line of a
+# paragraph.
 HEAD_SPACE_BEFORE = 16.0
 HEAD_SPACE_AFTER = 9.0
-LIST_INDENT_PT = 18.0          # mức thụt lề của dòng gạch đầu dòng
+LIST_INDENT_PT = 18.0          # indent of a bullet line
 
-# Vùng trống hẹp hơn ngần này thì không đặt nổi lấy một dòng chữ
+# A gap narrower than this cannot hold even one line of text
 MIN_PLACE_PT = 24.0
-# Chặn vòng lặp đặt khối: một khối không bao giờ dài tới ngần này trang
+# Guard on the block-placement loop: no block is ever this many pages long
 _MAX_PAGES_PER_BLOCK = 500
-# Số lượt dựng lại để dồn tiêu đề bị bỏ trơ cuối trang sang trang mới. Đẩy một
-# tiêu đề xuống trang sau làm mọi thứ phía dưới trôi theo và đôi khi lộ ra một
-# tiêu đề trơ khác, nên phải soát vài lượt; vòng lặp tự dừng ngay khi một lượt
-# không tìm thấy chỗ nào mới, nên tài liệu bình thường chỉ tốn một lượt.
+# Rebuild passes used to push headings stranded at the foot of a page onto the
+# next one. Moving a heading down shifts everything below it and sometimes
+# exposes another stranded heading, so several passes may be needed; the loop
+# stops as soon as a pass finds nothing new, so an ordinary document costs one.
 _MAX_REFLOW_PASSES = 10
 
-# Bề rộng vùng nội dung A4 khi lề 2cm (đơn vị pt), dùng để co ảnh cho vừa
+# Width of the A4 content area at 2cm margins, in points; used to fit images
 CONTENT_WIDTH_PT = 470.0
 
-# Font phải có đủ dấu tiếng Việt. Base-14 của PDF thì không, nên phải nhúng
-# font hệ thống; cặp đầu tiên tìm thấy sẽ được dùng.
+# The font must carry the full set of Vietnamese diacritics. The PDF base-14
+# fonts do not, so a system font has to be embedded; the first pair found wins.
 _FONT_CANDIDATES = [
     ("times.ttf", "timesbd.ttf"),
     ("arial.ttf", "arialbd.ttf"),
@@ -72,14 +74,14 @@ DOCX_FONT = "Times New Roman"
 # --- .docx ---------------------------------------------------------------
 
 def _md_rows(md: str) -> list[list[str]]:
-    """Đọc ngược bảng markdown thành các hàng ô."""
+    """Parse a markdown table back into rows of cells."""
     rows: list[list[str]] = []
     for line in md.split("\n"):
         line = line.strip()
         if not line.startswith("|"):
             continue
         if set(line.replace("|", "").replace(" ", "")) <= {"-"}:
-            continue                      # dòng phân cách của markdown
+            continue                      # markdown's separator line
         cells = re.split(r"(?<!\\)\|", line.strip().strip("|"))
         rows.append([c.strip().replace("\\|", "|") for c in cells])
     return rows
@@ -97,11 +99,11 @@ def _setup_docx(document) -> None:
 
 
 def _outline_level(para, level: int) -> None:
-    """Đánh dấu đoạn này là tiêu đề cấp `level` trong cấu trúc của Word.
+    """Mark this paragraph as a level-`level` heading in Word's own structure.
 
-    Cỡ chữ và độ đậm là thứ mô hình DLA nhìn thấy; `outlineLvl` là thứ Word và
-    các bộ chuyển đổi sang PDF đọc được, nhờ đó bản PDF có sẵn cây bookmark
-    đúng cấp mục.
+    Size and weight are what the DLA model sees; `outlineLvl` is what Word and
+    the PDF converters read, which is how the exported PDF ends up with a
+    bookmark tree at the right levels.
     """
     pPr = para._p.get_or_add_pPr()
     tag = OxmlElement("w:outlineLvl")
@@ -111,15 +113,16 @@ def _outline_level(para, level: int) -> None:
 
 def _docx_heading(document, item: PageItem) -> None:
     para = document.add_paragraph()
-    # Khoảng trắng rộng ở trên/dưới là dấu hiệu mạnh nhất để DLA tách tiêu đề
-    # ra khỏi đoạn văn liền kề.
+    # Generous whitespace above and below is the strongest cue the DLA model has
+    # for separating a heading from the paragraph next to it.
     para.paragraph_format.space_before = Pt(HEAD_SPACE_BEFORE)
     para.paragraph_format.space_after = Pt(HEAD_SPACE_AFTER)
     para.paragraph_format.left_indent = Pt(0)
     para.paragraph_format.first_line_indent = Pt(0)
     para.paragraph_format.keep_with_next = True
     para.paragraph_format.keep_together = True
-    # Tiêu đề tài liệu căn giữa như mọi văn bản hành chính, đề mục căn trái
+    # The document title is centred as in any administrative document; section
+    # headings are left-aligned
     para.alignment = (WD_ALIGN_PARAGRAPH.CENTER if item.level <= 0
                       else WD_ALIGN_PARAGRAPH.LEFT)
     _outline_level(para, max(item.level, 1))
@@ -130,11 +133,11 @@ def _docx_heading(document, item: PageItem) -> None:
 
 
 def _docx_body(document, item: PageItem) -> None:
-    """Ghi một khối nội dung, tách riêng các dòng gạch đầu dòng.
+    """Write one content block, keeping bullet lines separate.
 
-    Gộp cả khối vào một đoạn căn đều sẽ làm dòng gạch đầu dòng trông y hệt văn
-    xuôi; thụt lề thật thì DLA gán đúng nhãn `list-item` và cây phân cấp giữ
-    được quan hệ mục cha – ý con.
+    Collapsing the block into a single justified paragraph makes bullet lines
+    look exactly like prose; a real indent gets them labelled `list-item` and the
+    hierarchy keeps the parent-section / child-item relationship.
     """
     for line in item.text.split("\n"):
         if not line.strip():
@@ -155,7 +158,7 @@ def _docx_body(document, item: PageItem) -> None:
 
 
 def _row_property(row, tag: str) -> None:
-    """Bật một thuộc tính bool của hàng bảng (w:tblHeader, w:cantSplit)."""
+    """Turn on a boolean row property (w:tblHeader, w:cantSplit)."""
     trPr = row._tr.get_or_add_trPr()
     trPr.append(OxmlElement(tag))
 
@@ -172,15 +175,16 @@ def _keep_row_together(row) -> None:
 def _docx_table(document, item: PageItem) -> None:
     rows = _md_rows(item.text)
     if not rows:
-        # không còn hàng bảng nào (đã bị trải thành văn xuôi) -> ghi như đoạn
-        # văn, tuyệt đối không bỏ trắng vì như vậy là mất nội dung
+        # no table rows left (it was spread into prose) -> write it as a
+        # paragraph; never leave it blank, that would lose content
         _docx_body(document, item)
         return
     width = max(len(r) for r in rows)
     table = document.add_table(rows=len(rows), cols=width)
     table.style = "Table Grid"
-    # Bảng dài vắt qua trang: lặp lại hàng tiêu đề ở mỗi trang và không cho
-    # hàng nào bị ngắt làm đôi — hàng đứt đôi là lỗi hệ RAG phải sửa tay.
+    # A long table crossing a page break: repeat the header row on every page and
+    # let no row be split in half — a split row is a fault someone has to correct
+    # by hand downstream.
     _repeat_header_row(table)
     for row in table.rows:
         _keep_row_together(row)
@@ -211,7 +215,7 @@ def _docx_figure(document, item: PageItem) -> None:
             run.italic = True
             run.font.size = Pt(BODY_PT - 1)
         return
-    # không có file ảnh -> giữ lại dòng giữ chỗ để không mất dấu vết của hình
+    # no image file -> keep the placeholder line so the figure leaves a trace
     para = document.add_paragraph()
     run = para.add_run(item.text)
     run.italic = True
@@ -241,7 +245,7 @@ def write_docx(pages: list[LayoutPage], dst: str) -> None:
 # --- .pdf ----------------------------------------------------------------
 
 def _font_files() -> tuple[str, str, str] | None:
-    """Tìm cặp font thường/đậm có sẵn trong hệ thống."""
+    """Find an available regular/bold font pair on this system."""
     for folder in _FONT_DIRS:
         if not os.path.isdir(folder):
             continue
@@ -291,7 +295,7 @@ def _item_html(item: PageItem) -> str:
     if item.kind == "heading":
         level = min(max(item.level, 1), 5)
         style = f"font-size: {item.size}px"
-        if item.level <= 0:             # tiêu đề tài liệu
+        if item.level <= 0:             # the document title
             style += "; text-align: center"
         return f'<h{level} style="{style}">{html.escape(item.text)}</h{level}>'
 
@@ -299,7 +303,7 @@ def _item_html(item: PageItem) -> str:
         html_table = _table_html(item.text)
         if html_table:
             return html_table
-        return f"<p>{html.escape(item.text)}</p>"   # đã trải thành văn xuôi
+        return f"<p>{html.escape(item.text)}</p>"   # already spread into prose
 
     if item.kind == "figure":
         path = item.meta.get("file") or ""
@@ -314,8 +318,8 @@ def _item_html(item: PageItem) -> str:
             return out
         return f'<p class="fig">{html.escape(item.text)}</p>'
 
-    # mỗi dòng một thẻ <p> riêng: dòng gạch đầu dòng cần thụt lề thật để DLA
-    # nhận ra là list-item thay vì đọc dính vào đoạn văn trên
+    # one <p> per line: a bullet line needs a real indent for the DLA model to
+    # read it as a list-item rather than run it into the paragraph above
     parts = [f'<p{" class=\"li\"" if _BULLET.match(line) else ""}>'
              f"{html.escape(line.strip())}</p>"
              for line in item.text.split("\n") if line.strip()]
@@ -326,15 +330,17 @@ def _page_html(page: LayoutPage) -> str:
     return "".join(_item_html(i) for i in page.items) or "<p></p>"
 
 
-# Bảng ToUnicode do MuPDF dựng lại trỏ nhầm vài glyph sang ký tự "song trùng" —
-# ký tự khác hẳn nhưng vẽ ra y hệt, nên nhìn trên giấy không thấy gì sai:
+# The ToUnicode table MuPDF rebuilds maps a few glyphs to their "twin"
+# characters — a completely different codepoint that draws identically, so
+# nothing looks wrong on paper:
 #
-#   dấu cách  -> U+00A0 (dấu cách không ngắt)
-#   dấu gạch  -> U+00AD (gạch nối mềm, vốn là ký tự vô hình)
-#   chấm phẩy -> U+037E (dấu chấm hỏi Hy Lạp)
+#   space     -> U+00A0 (non-breaking space)
+#   hyphen    -> U+00AD (soft hyphen, an invisible character)
+#   semicolon -> U+037E (Greek question mark)
 #
-# Mọi công cụ đọc lại PDF vì thế nhận về một chuỗi không có lấy một dấu cách hay
-# dấu gạch thường nào — tokenizer, BM25 và các bước tách từ phía RAG hỏng theo.
+# Every tool that reads the PDF back therefore receives a string without a
+# single ordinary space or hyphen in it — tokenizers, BM25 and the word
+# segmentation downstream all break with it.
 _ALIASES = {0x00A0: 0x0020, 0x00AD: 0x002D, 0x037E: 0x003B}
 
 _BFCHAR = re.compile(rb"^<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]{4})>$")
@@ -347,7 +353,10 @@ def _alias_of(code: bytes) -> bytes | None:
 
 
 def _fix_tounicode_aliases(doc: fitz.Document) -> int:
-    """Trỏ lại các glyph bị ánh xạ nhầm về đúng ký tự. Trả về số font đã sửa."""
+    """Point the mismapped glyphs back at the right characters.
+
+    Returns the number of fonts that were fixed.
+    """
     probes = [f"{code:04x}".encode() for code in _ALIASES]
     fixed = 0
     for xref in range(1, doc.xref_length()):
@@ -387,8 +396,9 @@ def _fix_tounicode_aliases(doc: fitz.Document) -> int:
                     if lo.lower() == hi.lower():
                         out.append(b"<" + lo + b"> <" + hi + b"> <" + alias + b">")
                     else:
-                        # dải *bắt đầu* từ ký tự sai: tách riêng mã đầu, phần
-                        # còn lại vẫn phải trỏ về ký tự kế tiếp cho đúng thứ tự
+                        # a range that *starts* at the wrong character: split off
+                        # the first code, and the rest still has to point at the
+                        # next character to keep the order right
                         nxt = f"{int(lo, 16) + 1:04x}".encode()
                         after = f"{int(dst, 16) + 1:04x}".encode()
                         out.append(b"<" + lo + b"> <" + lo + b"> <" + alias + b">")
@@ -404,14 +414,14 @@ def _fix_tounicode_aliases(doc: fitz.Document) -> int:
 
 
 class _Sheet:
-    """Con trỏ ghi: trang đang mở và mép dưới của phần đã ghi trên trang đó."""
+    """The write cursor: the open page and the bottom edge of what is on it."""
 
     def __init__(self, writer, paper: fitz.Rect, frame: fitz.Rect,
                  first_page: int = 0):
         self.writer, self.paper, self.frame = writer, paper, frame
         self.device = None
         self.y = frame.y0
-        self.page = first_page - 1     # chưa mở trang nào
+        self.page = first_page - 1     # no page opened yet
 
     @property
     def at_top(self) -> bool:
@@ -437,25 +447,26 @@ class _Sheet:
 
 
 def _keep_together(items: list[PageItem]) -> list[tuple[list[PageItem], int]]:
-    """Gom các khối phải nằm cùng một trang, kèm số dòng tiêu đề mở đầu khối.
+    """Group blocks that must share a page, with the count of leading headings.
 
-    Một khối = loạt dòng tiêu đề liền nhau + khối nội dung ngay sau chúng. Các
-    dòng tiêu đề liền nhau (tiêu đề mục cha rồi tới mục con đầu tiên) phải đi
-    cùng nhau, và phải kéo theo được ít nhất một mẩu nội dung của chính mình —
-    nếu không thì tiêu đề ở lại trơ trọi cuối trang, đúng lỗi đang phải sửa.
+    A group = a run of consecutive heading lines plus the content block right
+    after them. Consecutive headings (a parent section's heading followed by its
+    first child's) have to travel together, and they must drag along at least a
+    fragment of their own content — otherwise the heading is left stranded at the
+    foot of the page, which is the very fault being fixed here.
     """
     groups: list[list[PageItem]] = []
     heads: list[int] = []
     for item in items:
         if item.kind == "heading":
             if groups and len(groups[-1]) == heads[-1]:
-                groups[-1].append(item)      # nối vào loạt tiêu đề đang mở
+                groups[-1].append(item)      # extend the open run of headings
                 heads[-1] += 1
                 continue
             groups.append([item])
             heads.append(1)
         elif groups and len(groups[-1]) == heads[-1] and heads[-1]:
-            groups[-1].append(item)          # mẩu nội dung đầu tiên của loạt
+            groups[-1].append(item)          # the run's first piece of content
         else:
             groups.append([item])
             heads.append(0)
@@ -463,7 +474,7 @@ def _keep_together(items: list[PageItem]) -> list[tuple[list[PageItem], int]]:
 
 
 def _natural_height(group: list[PageItem]) -> float:
-    """Chiều cao khối này *phải* có để không bị bóp lại — chỉ hình mới có."""
+    """The height this group *needs* in order not to be squashed — figures only."""
     return max((float(i.meta.get("height") or 0)
                 for i in group if i.kind == "figure"), default=0.0)
 
@@ -471,11 +482,11 @@ def _natural_height(group: list[PageItem]) -> float:
 def _draw_flow(sheet: _Sheet, items: list[PageItem], css: str,
                archive: fitz.Archive,
                forced: set[int]) -> list[tuple[int, int, bool]]:
-    """Đổ các khối xuống trang.
+    """Pour the blocks onto pages.
 
-    Trả về vết đặt khối: (chỉ số khối, trang bắt đầu, khối có mở đầu bằng tiêu
-    đề không). `forced` là các khối phải mở trang mới trước khi đặt — kết quả
-    soát lại của lượt dựng trước.
+    Returns a placement trace: (block index, starting page, whether the block
+    opens with a heading). `forced` holds the blocks that must start on a fresh
+    page — the findings of the previous rebuild pass.
     """
     trace: list[tuple[int, int, bool]] = []
     sheet.new_page()
@@ -483,10 +494,11 @@ def _draw_flow(sheet: _Sheet, items: list[PageItem], css: str,
         markup = "".join(_item_html(i) for i in group)
         if not markup:
             continue
-        # Chỗ trống không đủ cao thì MuPDF *co ảnh lại* cho vừa thay vì đẩy
-        # sang trang sau — một lưu đồ cao 630pt rơi vào cuối trang sẽ bị nén
-        # còn hơn một phần ba và không còn đọc được chữ trong ô. Mở trang mới
-        # trước khi đặt là cách duy nhất giữ nguyên cỡ hình.
+        # When the remaining gap is too short, MuPDF *shrinks the image* to fit
+        # rather than pushing it to the next page — a 630pt flowchart landing at
+        # the foot of a page is squeezed to under a third of its size and the
+        # text in its boxes becomes unreadable. Opening a new page before placing
+        # it is the only way to keep a figure at full size.
         need = min(_natural_height(group), sheet.frame.height)
         if not sheet.at_top and (index in forced
                                  or sheet.room < max(MIN_PLACE_PT, need)):
@@ -508,12 +520,13 @@ def _draw_flow(sheet: _Sheet, items: list[PageItem], css: str,
 
 
 def _stranded_pages(doc: fitz.Document) -> set[int]:
-    """Các trang kết thúc bằng một dòng tiêu đề, không còn nội dung phía dưới.
+    """Pages that end on a heading line with no content below it.
 
-    Chỗ ngắt trang do MuPDF quyết định sau khi đã xếp chữ, và `place()` không
-    nói được phần nào thật sự hiện ra: với một hàng bảng cao hơn chỗ trống còn
-    lại, nó báo đã dùng hết chỗ nhưng thực tế chỉ vẽ mỗi dòng tiêu đề. Cách duy
-    nhất chắc chắn là đọc lại trang vừa dựng và xem dưới tiêu đề còn gì không.
+    MuPDF decides page breaks after laying out the text, and `place()` cannot
+    report what actually appeared: given a table row taller than the remaining
+    gap, it reports the space as used while in fact drawing nothing but the
+    heading line. The only reliable check is to read the rendered page back and
+    see whether anything follows the heading.
     """
     stranded: set[int] = set()
     for number in range(doc.page_count - 1):
@@ -533,7 +546,7 @@ def _stranded_pages(doc: fitz.Document) -> set[int]:
         if last_size <= BODY_PT + 0.4:
             continue
         if any(info["bbox"][3] > bottom for info in page.get_image_info()):
-            continue                    # dưới tiêu đề là một hình, không phải trống
+            continue                    # a figure follows the heading, not blank space
         stranded.add(number)
     return stranded
 
@@ -541,14 +554,17 @@ def _stranded_pages(doc: fitz.Document) -> set[int]:
 def _render(pages: list[LayoutPage], css: str, archive: fitz.Archive,
             paper: fitz.Rect, frame: fitz.Rect,
             forced: dict[int, set[int]]) -> tuple[bytes, dict[int, tuple[int, int]]]:
-    """Dựng cả tài liệu. Trả về (dữ liệu PDF, trang -> khối cuối cùng của trang)."""
+    """Render the whole document.
+
+    Returns (PDF bytes, page -> the last block placed on that page).
+    """
     buffer = io.BytesIO()
     writer = fitz.DocumentWriter(buffer)
     last_on_page: dict[int, tuple[int, int]] = {}
     next_page = 0
     for index, page in enumerate(pages):
-        # Mỗi LayoutPage mở một trang mới: ở chế độ mỗi mục một trang, đó chính
-        # là ranh giới trang cần giữ.
+        # Every LayoutPage opens a new sheet: in one-page-per-section mode that
+        # is exactly the page boundary to preserve.
         sheet = _Sheet(writer, paper, frame, next_page)
         for group, page_no, is_head in _draw_flow(sheet, page.items, css,
                                                   archive,
@@ -572,15 +588,16 @@ def write_pdf(pages: list[LayoutPage], dst: str, figure_dir: str | None = None) 
 
     css = _css(font)
     paper = fitz.paper_rect("a4")
-    frame = paper + (57, 57, -57, -57)      # lề 2cm
+    frame = paper + (57, 57, -57, -57)      # 2cm margins
 
     os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
-    # Dựng trong bộ nhớ rồi mới ghi ra: bản thô nhúng nguyên vẹn font hệ thống
-    # (vài MB), phải rút gọn font trước khi lưu.
+    # Render in memory before writing: the raw build embeds the entire system
+    # font (several MB), which has to be subset before saving.
     #
-    # Dựng lại vài lượt: mỗi lượt đọc trang vừa dựng, tìm những dòng tiêu đề bị
-    # bỏ lại trơ trọi ở đáy trang rồi đánh dấu cho lượt sau mở trang mới ngay
-    # trước chúng. Số khối bị đánh dấu chỉ tăng nên vòng lặp chắc chắn dừng.
+    # Several rebuild passes: each one reads the pages just rendered, finds the
+    # heading lines left stranded at the foot of a page and marks them so the
+    # next pass opens a fresh page right before them. The set of marked blocks
+    # only grows, so the loop is guaranteed to terminate.
     forced: dict[int, set[int]] = {}
     data, last_on_page = _render(pages, css, archive, paper, frame, forced)
     for _ in range(_MAX_REFLOW_PASSES):
@@ -604,10 +621,10 @@ def write_pdf(pages: list[LayoutPage], dst: str, figure_dir: str | None = None) 
 
     doc = fitz.open("pdf", data)
     try:
-        doc.subset_fonts()          # chỉ giữ các ký tự thật sự xuất hiện
+        doc.subset_fonts()          # keep only the characters actually used
     except (AttributeError, RuntimeError):
         pass
-    _fix_tounicode_aliases(doc)     # sau khi rút gọn font, vì bước đó dựng lại ToUnicode
+    _fix_tounicode_aliases(doc)     # after subsetting, which rebuilds ToUnicode
     try:
         doc.save(dst, garbage=4, deflate=True)
     finally:
@@ -615,11 +632,11 @@ def write_pdf(pages: list[LayoutPage], dst: str, figure_dir: str | None = None) 
 
 
 def write(pages: list[LayoutPage], dst: str, figure_dir: str | None = None) -> None:
-    """Ghi ra file theo đuôi của `dst`."""
+    """Write the file, choosing the writer from `dst`'s extension."""
     ext = os.path.splitext(dst)[1].lower()
     if ext == ".pdf":
         write_pdf(pages, dst, figure_dir=figure_dir)
     elif ext == ".docx":
         write_docx(pages, dst)
     else:
-        raise ValueError(f"Định dạng chưa hỗ trợ: {ext}")
+        raise ValueError(f"Unsupported format: {ext}")

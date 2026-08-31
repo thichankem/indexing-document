@@ -1,15 +1,16 @@
-"""Cắt tài liệu thành chunk: mỗi chunk nằm gọn trong một trang và một mục.
+"""Split a document into chunks: each one inside a single page and section.
 
-Ba ràng buộc chính:
-  1. Không chunk nào vượt trần **512 token** — giới hạn của khâu embedding phía
-     RAG; phần vượt trần bị cắt cụt lặng lẽ nên phải chặn từ đây.
-  2. Không chunk nào vắt qua ranh giới trang -> tránh lỗi ghép nhầm nội dung
-     giữa các trang khi trích xuất PDF.
-  3. Không chunk nào chứa hai mục khác nhau -> vector phản ánh đúng một chủ đề.
+Three constraints drive everything here:
+  1. No chunk may exceed the **512 token** ceiling — the limit of the RAG
+     embedding step, which truncates the overflow silently, so it has to be
+     enforced here.
+  2. No chunk may straddle a page boundary -> avoids stitching together content
+     that PDF extraction pulled from two different pages.
+  3. No chunk may hold two different sections -> the vector reflects one topic.
 
-Khi một mục trải dài nhiều trang, nó bị cắt thành nhiều chunk nhưng mỗi chunk
-đều mang đường dẫn mục lục đầy đủ và các liên kết prev/next để lấy lại đủ ngữ
-cảnh lúc truy vấn.
+When a section spans several pages it is split into several chunks, but each
+one carries the full outline path and prev/next links so the complete context
+can be recovered at query time.
 """
 from __future__ import annotations
 
@@ -19,35 +20,39 @@ from dataclasses import dataclass, field
 
 from .models import Chunk, Section, clean_text
 
-# Trần token của hệ thống RAG đích. Mọi kích thước bên dưới đo bằng token chứ
-# không đo bằng ký tự, vì đây mới là thứ phía embedding thật sự đếm.
+# The token ceiling of the target RAG stack. Every size below is measured in
+# tokens rather than characters, because tokens are what the embedding step
+# actually counts.
 MAX_TOKENS = 512
-# Dưới ngưỡng này thì mục đứng một mình quá mỏng, vector gần như không mang
-# thông tin — gộp với mục liền kề chừng nào tổng còn nằm trong trần 512.
+# Below this a section standing on its own is too thin, and its vector carries
+# almost no information — merge it with a neighbour as long as the total still
+# fits under the 512 ceiling.
 #
-# Ngưỡng đặt cao gần nửa trần là có chủ ý: đo trên 18 tài liệu thật, hạ xuống
-# 60 để lại 389 chunk dưới 200 token, còn nâng lên quá 200 thì gần như không
-# đổi gì nữa (890 -> 877 chunk) vì lúc đó trần 512 mới là thứ chặn lại.
+# Setting the threshold close to half the ceiling is deliberate: measured over
+# 18 real documents, dropping it to 60 leaves 389 chunks under 200 tokens, while
+# raising it past 200 changes almost nothing (890 -> 877 chunks) because by then
+# the 512 ceiling is the binding constraint.
 MIN_TOKENS = 200
 
-# Tokenizer đa ngữ (XLM-R/BGE-M3) tách tiếng Việt trung bình ~2.8 ký tự/token.
-# Lấy mức chặt hơn thực tế một chút để ước lượng không bao giờ thấp hơn số
-# token thật — đếm thiếu thì chunk bị cắt cụt lúc embedding.
+# A multilingual tokenizer (XLM-R/BGE-M3) splits Vietnamese at roughly 2.8
+# characters per token. The figure is kept slightly tighter than reality so the
+# estimate never falls below the true token count — undercount and the chunk is
+# truncated at embedding time.
 CHARS_PER_TOKEN = 2.8
 
 
 @dataclass
 class ChunkConfig:
-    max_tokens: int = MAX_TOKENS   # trần kích thước một chunk (token)
-    min_tokens: int = MIN_TOKENS   # dưới ngưỡng này sẽ cố gộp với mục liền kề
-    overlap_sentences: int = 1     # số câu lặp lại khi một mục bị cắt ngang trang
+    max_tokens: int = MAX_TOKENS   # size ceiling of one chunk, in tokens
+    min_tokens: int = MIN_TOKENS   # below this, try to merge with a neighbour
+    overlap_sentences: int = 1     # sentences repeated when a section splits across pages
     include_path_prefix: bool = True
-    max_path_depth: int = 4        # số cấp mục lục đưa vào tiền tố
-    merge_short: bool = True       # gộp mục quá ngắn vào mục liền trước
+    max_path_depth: int = 4        # outline levels kept in the prefix
+    merge_short: bool = True       # merge very short sections into a neighbour
 
     @property
     def max_chars(self) -> int:
-        """Trần token quy đổi ra ký tự — chỉ dùng để báo cáo cho dễ hình dung."""
+        """The token ceiling expressed in characters — for readable reporting only."""
         return int(self.max_tokens * CHARS_PER_TOKEN)
 
 
@@ -60,20 +65,22 @@ def _split_sentences(text: str) -> list[str]:
 
 
 def est_tokens(text: str) -> int:
-    """Ước lượng số token của một đoạn tiếng Việt.
+    """Estimate the token count of a passage of Vietnamese text.
 
-    Lấy mức lớn nhất trong hai cách đếm, vì mỗi cách hụt ở một kiểu nội dung:
+    Takes the larger of two counts, because each undershoots on a different kind
+    of content:
 
-    * theo ký tự — hụt với bảng markdown, nơi dấu `|` dày đặc mà chuỗi lại ngắn;
-    * theo âm tiết + dấu — hụt với văn xuôi có nhiều từ dài.
+    * by characters — undershoots on markdown tables, where `|` is dense and the
+      string is short;
+    * by syllables plus punctuation — undershoots on prose full of long words.
 
-    Ước lượng cao hơn thực tế thì chunk nhỏ hơn trần một chút; ước lượng thấp
-    hơn thì chunk bị cắt cụt lúc embedding, nên luôn chọn phía an toàn.
+    Overestimating leaves the chunk slightly under the ceiling; underestimating
+    gets it truncated at embedding time, so always err on the safe side.
     """
     if not text.strip():
         return 0
     words = text.split()
-    # âm tiết tiếng Việt thường gọn trong một token, từ dài bị tách thêm
+    # a Vietnamese syllable usually fits one token; long words are split further
     syllables = sum(1 + len(w) // 7 for w in words)
     marks = sum(1 for ch in text if not ch.isalnum() and not ch.isspace())
     by_chars = math.ceil(len(text) / CHARS_PER_TOKEN)
@@ -81,7 +88,7 @@ def est_tokens(text: str) -> int:
 
 
 def _table_rows(md: str) -> tuple[list[str], list[str]]:
-    """Tách bảng markdown thành (dòng tiêu đề, các dòng dữ liệu)."""
+    """Split a markdown table into (header lines, data rows)."""
     lines = md.split("\n")
     if len(lines) >= 2 and set(lines[1].replace("|", "").replace(" ", "")) <= {"-"}:
         return lines[:2], lines[2:]
@@ -89,16 +96,16 @@ def _table_rows(md: str) -> tuple[list[str], list[str]]:
 
 
 def _row_cells(row: str) -> list[str]:
-    """Tách các ô của một dòng bảng markdown."""
+    """Split one markdown table row into its cells."""
     return [c.strip() for c in row.strip().strip("|").split("|")]
 
 
 def _row_as_fields(row: str, head_cells: list[str], limit: int,
                    measure=len) -> list[str]:
-    """Trải một hàng bảng quá dài thành các dòng "tên cột: giá trị"."""
+    """Spread an over-long table row into "column name: value" lines."""
     cells = [c for c in _row_cells(row) if c]
-    # Bảng một ô thực chất là khung văn bản, không phải dữ liệu có cột. Gắn
-    # nhãn "Cột 1:" vào chỉ thêm nhiễu, cứ trả về nguyên văn.
+    # A single-cell table is really a text frame, not columnar data. Labelling it
+    # "Column 1:" only adds noise, so return it verbatim.
     if len(cells) == 1 and not [h for h in head_cells if h]:
         return _split_long_text(cells[0], limit, measure)
 
@@ -106,7 +113,7 @@ def _row_as_fields(row: str, head_cells: list[str], limit: int,
     for i, cell in enumerate(_row_cells(row)):
         if not cell:
             continue
-        label = head_cells[i] if i < len(head_cells) and head_cells[i] else f"Cột {i + 1}"
+        label = head_cells[i] if i < len(head_cells) and head_cells[i] else f"Column {i + 1}"
         lines.append(f"{label}: {cell}")
 
     parts: list[str] = []
@@ -124,19 +131,20 @@ def _row_as_fields(row: str, head_cells: list[str], limit: int,
 
 
 def _split_table(md: str, limit: int, measure=len) -> list[str]:
-    """Cắt bảng dài theo hàng, giữ lại dòng tiêu đề ở mỗi phần.
+    """Split a long table by rows, repeating the header line in every part.
 
-    `measure` quyết định đơn vị của `limit`: mặc định đếm ký tự, chunker truyền
-    vào `est_tokens` để cắt đúng theo trần token của hệ RAG.
+    `measure` decides the unit of `limit`: characters by default, while the
+    chunker passes `est_tokens` so the split respects the RAG token ceiling.
     """
     header, rows = _table_rows(md)
     head_text = "\n".join(header)
     head_len = measure(head_text) + 1 if header else 0
 
-    # Dòng tiêu đề dài hơn cả trần thì không thể lặp lại ở mỗi phần, và bảng
-    # cũng không còn hàng nào để cắt. Bảng một hàng — ô gộp trải cả trang, hay
-    # gặp trong văn bản hành chính — rơi đúng vào đây: coi luôn dòng tiêu đề
-    # là dữ liệu, nếu không cả khối sẽ trả về nguyên vẹn và tràn trần token.
+    # A header line longer than the ceiling cannot be repeated in every part,
+    # and the table has no rows left to split on. A one-row table — a merged cell
+    # spanning the whole page, common in administrative documents — lands exactly
+    # here: treat the header as data, or the whole block comes back intact and
+    # blows past the token ceiling.
     if header and head_len > limit:
         rows = [header[0]] + rows
         header, head_len = [], 0
@@ -147,9 +155,10 @@ def _split_table(md: str, limit: int, measure=len) -> list[str]:
     current: list[str] = []
     size = head_len
     for row in rows:
-        # Một hàng dài hơn cả trần thì không thể giữ dạng bảng. Cắt ngang giữa
-        # hàng sẽ làm vỡ số cột và bảng thành vô nghĩa, nên chuyển hàng đó sang
-        # dạng "tên cột: giá trị" — vẫn đọc được và không mất dữ liệu.
+        # A row longer than the ceiling cannot stay in table form. Cutting it in
+        # half would break the column count and make the table meaningless, so
+        # that row becomes "column name: value" lines — still readable, and no
+        # data is lost.
         if measure(row) + head_len > limit:
             if current:
                 parts.append(("\n".join(header + current)) if header else "\n".join(current))
@@ -169,7 +178,7 @@ def _split_table(md: str, limit: int, measure=len) -> list[str]:
 
 
 def _split_long_text(text: str, limit: int, measure=len) -> list[str]:
-    """Cắt đoạn quá dài tại ranh giới câu để không đứt giữa chừng."""
+    """Split an over-long passage at sentence boundaries so nothing breaks mid-sentence."""
     if measure(text) <= limit:
         return [text]
     out: list[str] = []
@@ -179,7 +188,7 @@ def _split_long_text(text: str, limit: int, measure=len) -> list[str]:
             out.append(current.strip())
             current = sentence
         elif measure(sentence) > limit:
-            # một câu đơn lẻ vẫn vượt trần -> cắt cứng theo khoảng trắng
+            # a single sentence still exceeds the ceiling -> hard-split on spaces
             if current:
                 out.append(current.strip())
                 current = ""
@@ -201,7 +210,7 @@ def _split_long_text(text: str, limit: int, measure=len) -> list[str]:
 
 @dataclass
 class _Piece:
-    """Một mảnh nội dung thuộc đúng một mục và một trang, trước khi đánh số."""
+    """A piece of content belonging to exactly one section and page, before numbering."""
     section: Section
     page: int
     text: str
@@ -210,9 +219,9 @@ class _Piece:
 
 
 def _pieces_for_section(section: Section, cfg: ChunkConfig) -> list[_Piece]:
-    """Gom nội dung của một mục lại rồi tách theo trang."""
-    # Tiền tố mục lục sẽ được nối vào sau, phải trừ trước để chunk cuối cùng
-    # không vượt trần kích thước.
+    """Collect a section's content and split it by page."""
+    # The outline prefix is prepended later, so its cost is subtracted up front
+    # to keep the finished chunk under the size ceiling.
     budget = cfg.max_tokens - est_tokens(_prefix(section, cfg)) - 1
     budget = max(budget, cfg.max_tokens // 3)
 
@@ -250,7 +259,7 @@ def _pieces_for_section(section: Section, cfg: ChunkConfig) -> list[_Piece]:
             pieces.append(_Piece(section, page, body, has_table, list(figs)))
             continue
 
-        # Quá dài: cắt nhỏ, bảng cắt theo hàng còn văn bản cắt theo câu
+        # Too long: split it — tables by row, prose by sentence
         if has_table:
             segments: list[str] = []
             for part in by_page[page]:
@@ -273,17 +282,17 @@ def _pieces_for_section(section: Section, cfg: ChunkConfig) -> list[_Piece]:
 
 
 def _figs_in(segment: str, figures: list[dict]) -> list[dict]:
-    """Chỉ gắn hình cho đúng mảnh chứa dòng giữ chỗ của nó."""
-    if not figures or "[HÌNH:" not in segment:
+    """Attach a figure only to the piece that holds its placeholder line."""
+    if not figures or "[FIGURE:" not in segment:
         return []
     return [f for f in figures if not f.get("caption") or f["caption"] in segment] or list(figures)
 
 
 def _merge_small(pieces: list[_Piece], cfg: ChunkConfig) -> list[_Piece]:
-    """Gộp các mảnh quá ngắn với mục liền kề để vector đủ ngữ nghĩa.
+    """Merge pieces that are too short into a neighbour so the vector carries meaning.
 
-    Chỉ gộp khi cùng trang và cùng mục cha, nên chunk vẫn nằm trong một chủ đề
-    chung thay vì trộn hai nội dung không liên quan.
+    Merging only happens within one page and under one parent section, so the
+    chunk stays on a single broad topic instead of mixing unrelated content.
     """
     out: list[_Piece] = []
     for piece in pieces:
@@ -293,10 +302,10 @@ def _merge_small(pieces: list[_Piece], cfg: ChunkConfig) -> list[_Piece]:
         prev = out[-1]
         same_page = prev.page == piece.page
         same_parent = prev.section.path[:-1] == piece.section.path[:-1]
-        # mục cha chỉ có mỗi dòng tiêu đề thì nên đi kèm mục con đầu tiên,
-        # thay vì đứng riêng thành một chunk không mang thông tin gì
+        # a parent section holding nothing but its heading line belongs with its
+        # first child, rather than standing alone as a chunk carrying nothing
         is_parent = piece.section.path[:-1] == prev.section.path
-        # trừ tiền tố mục lục của mảnh đứng sau, vì nó sẽ được nối vào lúc cuối
+        # subtract the following piece's outline prefix, added at the very end
         room = cfg.max_tokens - est_tokens(_prefix(piece.section, cfg)) - 1
         fits = est_tokens(prev.text) + est_tokens(piece.text) + 1 <= room
         if same_page and (same_parent or is_parent) and fits and (
@@ -307,7 +316,7 @@ def _merge_small(pieces: list[_Piece], cfg: ChunkConfig) -> list[_Piece]:
             prev.has_table = prev.has_table or piece.has_table
             prev.figures = prev.figures + piece.figures
             if is_parent:
-                # nội dung thực chất thuộc mục con -> lấy đường dẫn chi tiết hơn
+                # the content really belongs to the child -> take the finer path
                 prev.section = piece.section
             elif prev.section is not piece.section:
                 prev.section = _common_parent(prev.section, piece.section)
@@ -317,7 +326,7 @@ def _merge_small(pieces: list[_Piece], cfg: ChunkConfig) -> list[_Piece]:
 
 
 def _split_mixed(text: str, limit: int) -> list[str]:
-    """Cắt một mảnh vừa có văn xuôi vừa có bảng, theo trần token."""
+    """Split a piece that mixes prose and tables, respecting the token ceiling."""
     out: list[str] = []
     for part in text.split("\n"):
         if part.lstrip().startswith("|"):
@@ -334,11 +343,11 @@ def _split_mixed(text: str, limit: int) -> list[str]:
 
 
 def _enforce_budget(pieces: list[_Piece], cfg: ChunkConfig) -> list[_Piece]:
-    """Chốt chặn cuối cùng: không mảnh nào vượt trần token sau khi gộp.
+    """The final backstop: no piece exceeds the token ceiling after merging.
 
-    Bước gộp mảnh ngắn và bước thêm tiền tố mục lục đều làm chunk dài thêm.
-    Vượt trần nghĩa là phía embedding cắt cụt lặng lẽ, nên phải soát lại một
-    lượt thay vì tin vào các bước trước.
+    Both merging short pieces and prepending the outline prefix make a chunk
+    longer. Going over the ceiling means the embedding step truncates silently,
+    so everything is re-checked here rather than trusted from earlier steps.
     """
     out: list[_Piece] = []
     for piece in pieces:
@@ -354,7 +363,7 @@ def _enforce_budget(pieces: list[_Piece], cfg: ChunkConfig) -> list[_Piece]:
 
 
 def _common_parent(a: Section, b: Section) -> Section:
-    """Mục đại diện cho hai mục anh em đã gộp: giữ mục đầu, nới tiêu đề."""
+    """The section representing two merged siblings: keep the first, widen the span."""
     if a.path == b.path:
         return a
     merged = Section(
@@ -392,7 +401,7 @@ def build_chunks(
     pieces = _merge_small(pieces, cfg)
     pieces = _enforce_budget(pieces, cfg)
 
-    # Đếm số phần của mỗi mục để ghi part_index/part_total
+    # Count the parts of each section so part_index/part_total can be filled in
     counts: dict[str, int] = {}
     for piece in pieces:
         key = piece.section.path_str
@@ -415,9 +424,10 @@ def build_chunks(
 
         raw = piece.text
         prefix = _prefix(piece.section, cfg)
-        # Mục bị cắt ngang: lặp lại câu cuối của phần trước để hai nửa gần nhau
-        # hơn trong không gian vector và không mất mạch nội dung. Câu lặp cũng
-        # tính vào trần token, nên chỉ thêm khi còn chỗ.
+        # A section split in two: repeat the previous part's last sentence so the
+        # halves sit closer in vector space and the thread of the content is not
+        # lost. The repeated sentence counts against the ceiling too, so it is
+        # only added when there is room.
         if is_continuation and cfg.overlap_sentences > 0 and prev_piece is not None:
             tail = _split_sentences(prev_piece.text)[-cfg.overlap_sentences:]
             carry = " ".join(tail).strip()
@@ -425,8 +435,8 @@ def build_chunks(
             if carry and used <= cfg.max_tokens:
                 raw = f"[...] {carry}\n{raw}"
 
-        # Tiền tố đã chứa dòng tiêu đề; lặp lại y nguyên ngay dưới chỉ tốn chỗ
-        # và làm loãng vector.
+        # The prefix already carries the heading line; repeating it verbatim just
+        # below only costs space and dilutes the vector.
         body = raw
         if prefix:
             first, sep, rest = raw.partition("\n")
@@ -435,8 +445,8 @@ def build_chunks(
         text = f"{prefix}\n{body}".strip() if prefix else raw
 
         chunk_id = f"{doc_id}#p{piece.page}#{index:04d}"
-        # Đếm token trên đúng chuỗi sẽ đem đi embedding, không phải bản trước
-        # khi chuẩn hoá khoảng trắng — hai bản lệch nhau vài token.
+        # Count tokens on the exact string that goes to embedding, not the one
+        # before whitespace normalisation — the two differ by a few tokens.
         final = clean_text_keep_newlines(text)
         chunks.append(Chunk(
             chunk_id=chunk_id,
@@ -473,6 +483,6 @@ def build_chunks(
 
 
 def clean_text_keep_newlines(text: str) -> str:
-    """Chuẩn hoá khoảng trắng nhưng giữ xuống dòng (bảng markdown cần nó)."""
+    """Normalise whitespace but keep newlines (markdown tables need them)."""
     lines = [clean_text(line) for line in text.split("\n")]
     return "\n".join(line for line in lines if line != "").strip()

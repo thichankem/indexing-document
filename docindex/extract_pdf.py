@@ -1,4 +1,4 @@
-"""Đọc file .pdf thành danh sách Block, giữ lại tín hiệu bố cục (đậm, cỡ chữ)."""
+"""Read a .pdf into a list of Blocks, keeping the layout cues (bold, font size)."""
 from __future__ import annotations
 
 import re
@@ -9,38 +9,44 @@ import fitz
 from .images import collect_pdf_images, collect_vector_figures, export_figures
 from .models import Block, clean_text, rows_to_markdown
 
-BOLD_FLAG = 1 << 4          # bit "in đậm" trong span flags của PyMuPDF
-HEADER_ZONE = 0.10          # 10% chiều cao trên cùng coi là vùng header
-# Dải chân trang. Nới rộng hơn mức 10% đối xứng vì chân trang trong văn bản
-# ngân hàng thường có hai ba dòng (tên đơn vị, số phiên bản, câu bảo mật) và
-# dòng trên cùng của khối đó nằm quanh 85% chiều cao trang — để mốc ở 90% thì
-# nó không bao giờ được nhận là dòng lặp và trôi thẳng vào nội dung.
+BOLD_FLAG = 1 << 4          # the "bold" bit in PyMuPDF's span flags
+HEADER_ZONE = 0.10          # the top 10% of the page height is the header zone
+# The footer band. Wider than a symmetric 10% because footers in banking
+# documents usually run two or three lines (unit name, version number,
+# confidentiality notice) and the top line of that block sits around 85% of the
+# page height — put the mark at 90% and it is never recognised as a repeated
+# line and flows straight into the content.
 FOOTER_ZONE = 0.84
-REPEAT_RATIO = 0.3          # xuất hiện trên >=30% số trang thì coi là header/footer
-REPEAT_MIN_PAGES = 2        # tài liệu ngắn: lặp 2 trang đã đủ kết luận
-# Dải rộng dành riêng cho luật "lặp lại ở đúng một chỗ". Chân trang không phải
-# tài liệu nào cũng nằm sát đáy: có bản đặt số trang ở 81% chiều cao, cao hơn
-# mọi mốc chân trang hợp lý. Bù lại, luật này đòi hỏi dòng phải lặp *đúng một
-# toạ độ* qua các trang, nên nới dải ra không kéo theo nội dung thật.
+REPEAT_RATIO = 0.3          # on >=30% of pages counts as a header/footer
+REPEAT_MIN_PAGES = 2        # short documents: repeating on 2 pages settles it
+# A wider band reserved for the "repeats in exactly one spot" rule. Not every
+# document's footer sits at the very bottom: some place the page number at 81%
+# of the height, above any reasonable footer mark. In exchange, this rule
+# demands the line repeat at *exactly one coordinate* across pages, so widening
+# the band does not drag real content in with it.
 REPEAT_ZONE = 0.75
-# Chênh lệch toạ độ tối đa (tính theo phần chiều cao trang) giữa các lần xuất
-# hiện thì vẫn coi là "đúng một chỗ"
+# The largest coordinate spread (as a fraction of page height) between
+# occurrences that still counts as "exactly one spot"
 REPEAT_Y_SPREAD = 0.02
 
-# Cước chú nằm dưới đường kẻ cuối trang, luôn ở dải cuối và luôn nhỏ hơn cỡ
-# chữ nội dung ít nhất một point — hai dấu hiệu này đủ để khoanh vùng.
-FOOTNOTE_ZONE = 0.70        # từ 70% chiều cao trở xuống mới có thể là cước chú
-FOOTNOTE_SIZE_GAP = 1.0     # nhỏ hơn cỡ chữ nội dung ngần này point (pt)
-# Dấu tham chiếu cước chú nhỏ hơn chữ xung quanh ít nhất ngần này point
+# Footnotes sit under the rule at the foot of the page, always in the bottom
+# band and always at least one point smaller than the body — those two cues are
+# enough to locate them.
+FOOTNOTE_ZONE = 0.70        # only from 70% of the height down can be a footnote
+FOOTNOTE_SIZE_GAP = 1.0     # this many points smaller than the body size
+# A footnote reference mark is at least this many points smaller than the text
+# around it
 REF_MARK_GAP = 1.5
-# Số ký tự ngữ cảnh ghi lại để tìm đúng chỗ dấu tham chiếu trong text của bảng
+# Characters of context recorded so a reference mark can be located inside the
+# extracted text of a table cell
 REF_CONTEXT = 12
 
-# Trang có dưới ngần này ký tự coi như không có lớp text. Để mốc trên 0 vì bản
-# scan vẫn hay được đóng thêm một dòng số trang hay dấu bản quyền dạng chữ.
+# A page with fewer characters than this is treated as having no text layer. The
+# mark is above 0 because scans often carry a stamped page number or copyright
+# line as real text.
 SCAN_PAGE_CHARS = 40
 
-# Các dòng chân trang quen thuộc trong văn bản hành chính/ngân hàng
+# Footer lines common in Vietnamese administrative and banking documents
 _BOILERPLATE = re.compile(
     r"^("
     r"(tài liệu|văn bản|thông tin)\s+(nội bộ|mật|lưu hành nội bộ)"
@@ -53,60 +59,65 @@ _BOILERPLATE = re.compile(
     re.I,
 )
 
-# "9/34", "Trang 3", "- 5 -" ... là đánh số trang, không phải nội dung
+# "9/34", "Trang 3", "- 5 -" … are page numbers, not content
 _PAGE_NUM = re.compile(r"^(trang\s*)?[-–\s]*\d+\s*(/\s*\d+)?\s*[-–]*$", re.I)
-# dòng mục lục có chuỗi dấu chấm dẫn tới số trang
+# a TOC line, with dot leaders running to a page number
 _DOT_LEADER = re.compile(r"\.{4,}\s*\d*\s*$")
 
-# Nội dung của một span dấu tham chiếu cước chú: chỉ có số thứ tự (đôi khi vài
-# số ngăn nhau bằng dấu phẩy) hoặc ký hiệu quen thuộc.
+# What a footnote reference span contains: an index number (occasionally several
+# separated by commas) or one of the familiar symbols.
 _REF_MARK = re.compile(r"^(\d{1,3}([,;]\s*\d{1,3})*|[*†‡§¶]{1,3})$")
 
-# Dòng mở đầu một mục mới: gạch đầu dòng, "a)", "(i)", "1.2.", "Điều 5"
+# A line that opens a new item: a bullet, "a)", "(i)", "1.2.", "Điều 5"
 _ITEM_START = re.compile(
     r"^([-–•▪]|\(?[a-zA-Z]\)|\(?[ivx]+\)|(Điều|PHẦN|Phần|Chương|Mục)\b"
     r"|\d+(\.\d+)*[.)]?\s)"
 )
-# Lề treo rộng nhất còn coi là của cùng một đoạn — quá ngần này thì dòng thụt
-# vào là một mục con thật sự, không phải phần đuôi của dòng trên.
+# The widest hanging indent still treated as one paragraph — beyond this, an
+# indented line is a genuine sub-item, not the tail of the line above.
 HANGING_INDENT_PT = 60.0
 
-# Công cụ "làm phẳng" PDF (in ra PDF, gỡ form, ký số…) hay dựng lại từng dòng
-# chữ bằng cách đặt riêng vị trí cho mỗi glyph, và chèn giữa hai chữ cái một
-# glyph dấu cách rộng gần bằng không. Trên giấy không thấy gì lạ, nhưng mọi
-# công cụ đọc lại đều nhận về "B á n , x á c n h ậ n" — câu vỡ thành từng ký
-# tự rời, tokenizer và bản dựng lại hỏng theo, chữ in ra trông giãn nham nhở.
+# PDF "flattening" tools (print-to-PDF, form removal, digital signing…) often
+# rebuild each line of text by positioning every glyph individually, inserting a
+# near-zero-width space glyph between letters. Nothing looks wrong on paper, but
+# every tool that reads it back receives "B á n , x á c n h ậ n" — the sentence
+# shatters into loose characters, tokenizers and the rebuild break with it, and
+# the printed text comes out raggedly spaced.
 #
-# Dấu cách thật đẩy chữ kế tiếp đi một quãng thấy được (hẹp nhất cũng khoảng
-# 0.2 lần cỡ chữ), dấu cách giả thì không đẩy gì cả. PyMuPDF trả về hộp bao của
-# từng glyph theo bước tiến, nên hai chữ cái liền nhau trong một từ luôn sát
-# nhau — cứ đo khoảng hở giữa hai glyph *thật* là phân biệt được, không cần tin
-# vào dấu cách có sẵn trong file.
-GHOST_SPACE_RATIO = 0.12    # hở hẹp hơn ngần này lần cỡ chữ thì không phải dấu cách
+# A real space pushes the next character a visible distance (0.2x the font size
+# at the narrowest); a ghost space pushes nothing. PyMuPDF returns each glyph's
+# bounding box from its advance, so two letters inside a word always sit flush —
+# measuring the gap between *real* glyphs tells them apart, with no need to trust
+# the space characters stored in the file.
+GHOST_SPACE_RATIO = 0.12    # a gap narrower than this fraction of the font size is not a space
 
-# Chỉ nhận là bảng khi khung của nó được vẽ bằng nét kẻ thật. Mặc định PyMuPDF
-# còn coi hình chữ nhật tô mỏng là nét kẻ, và nếu vẫn không thấy bảng nào thì
-# lùi về đoán khung theo khoảng trắng giữa các từ. Cả hai lối đoán ấy đều vỡ
-# trên file đã làm phẳng: file loại này rải đầy hình chữ nhật mỏng, còn dấu
-# cách giả giữa từng chữ cái thì mở ra vô số "cột" ảo. Kết quả là một đoạn văn
-# xuôi bị xẻ dọc thành bảng mười cột, chữ đứt ngang từ nằm rải khắp các ô.
+# Only accept a table when its frame is drawn with real rules. By default
+# PyMuPDF also counts thin filled rectangles as rules, and if it still finds no
+# table it falls back to guessing the frame from the whitespace between words.
+# Both guesses collapse on a flattened file: such files are littered with thin
+# rectangles, and the ghost spaces between individual letters open up countless
+# phantom "columns". The result is a paragraph of prose sliced lengthwise into a
+# ten-column table, with words broken across the cells.
 _TABLE_STRATEGY = {"vertical_strategy": "lines_strict",
                    "horizontal_strategy": "lines_strict"}
 
 
 def _rebuild_line(line: dict) -> None:
-    """Dựng lại `text` của từng span trong một dòng từ vị trí của từng glyph.
+    """Rebuild each span's `text` in a line from the position of every glyph.
 
-    Bỏ hẳn ký tự trắng có sẵn rồi đặt lại dấu cách theo khoảng hở đo được: dấu
-    cách giả (không đẩy chữ kế tiếp đi đâu) biến mất, còn chỗ ngắt từ chỉ được
-    đánh dấu bằng vị trí — không có glyph dấu cách nào — thì vẫn có dấu cách.
+    The whitespace characters already in the file are discarded and spaces are
+    reinserted from the measured gaps: a ghost space (one that pushes the next
+    character nowhere) disappears, while a word break marked only by position —
+    with no space glyph at all — still gets a space.
 
-    Phải chạy trên cả dòng chứ không từng span riêng lẻ: chữ có dấu thường lấy
-    glyph từ font khác nên PyMuPDF cắt dòng thành nhiều span, và dấu cách hay
-    rơi đúng vào cuối một span ("QUY " | "ĐỊNH"). Đo trong phạm vi một span thì
-    khoảng hở đó không còn ai đối chiếu và hai từ dính liền nhau.
+    This has to run over the whole line rather than span by span: accented
+    letters usually take their glyphs from a different font, so PyMuPDF cuts the
+    line into several spans, and a space often lands at the very end of one
+    ("QUY " | "ĐỊNH"). Measured within a single span, that gap has nothing to be
+    compared against and the two words run together.
 
-    Dòng xoay nghiêng thì trục ngang không nói lên điều gì, giữ nguyên chuỗi gốc.
+    On a rotated line the horizontal axis says nothing, so the original string is
+    kept as-is.
     """
     spans = line["spans"]
     if abs(line.get("dir", (1.0, 0.0))[1]) >= 0.01:
@@ -114,7 +125,7 @@ def _rebuild_line(line: dict) -> None:
             span["text"] = "".join(c["c"] for c in span.get("chars") or [])
         return
 
-    prev_end: float | None = None      # mép phải của glyph thật gần nhất
+    prev_end: float | None = None      # right edge of the nearest real glyph
     for span in spans:
         limit = GHOST_SPACE_RATIO * (span.get("size") or 0.0)
         out: list[str] = []
@@ -130,7 +141,7 @@ def _rebuild_line(line: dict) -> None:
 
 
 def _page_dict(page: fitz.Page) -> dict:
-    """Như `get_text("dict")`, nhưng text của mỗi span dựng lại từ hình học."""
+    """Like `get_text("dict")`, but each span's text is rebuilt from geometry."""
     data = page.get_text("rawdict")
     for block in data["blocks"]:
         if block["type"] != 0:
@@ -141,12 +152,12 @@ def _page_dict(page: fitz.Page) -> dict:
 
 
 def _norm_key(s: str) -> str:
-    """Chuẩn hoá để so khớp header/footer giữa các trang (bỏ chữ số)."""
+    """Normalise a line for header/footer matching across pages (digits dropped)."""
     return re.sub(r"\d+", "#", clean_text(s).lower())
 
 
 def _dominant_size(spans: list[dict]) -> float:
-    """Cỡ chữ chiếm phần lớn ký tự của một dòng."""
+    """The font size covering most of a line's characters."""
     counter: Counter[float] = Counter()
     for span in spans:
         text = span["text"].strip()
@@ -156,16 +167,16 @@ def _dominant_size(spans: list[dict]) -> float:
 
 
 def _is_ref_mark(span: dict, main: float) -> bool:
-    """Span này có phải dấu tham chiếu cước chú (số mũ nhỏ) không?"""
+    """Is this span a footnote reference mark (a small superscript number)?"""
     return bool(main and span["size"] <= main - REF_MARK_GAP
                 and _REF_MARK.match(span["text"].strip()))
 
 
 def _starts_with_ref_mark(line: dict) -> bool:
-    """Dòng có mở đầu bằng dấu tham chiếu cước chú không?
+    """Does the line open with a footnote reference mark?
 
-    Đây là dấu hiệu nhận ra dòng *đầu* của một cước chú ở cuối trang, tách nó
-    khỏi đoạn nội dung bình thường cũng in cỡ chữ nhỏ.
+    This is what identifies the *first* line of a footnote at the foot of a page,
+    telling it apart from an ordinary passage that also happens to be set small.
     """
     main = _dominant_size(line["spans"])
     for span in line["spans"]:
@@ -175,14 +186,16 @@ def _starts_with_ref_mark(line: dict) -> bool:
 
 
 def _line_text(line: dict) -> str:
-    """Ghép các span trong một dòng.
+    """Join the spans of one line.
 
-    PDF xuất từ Word hay tách chỉ mục thành span riêng ("1." | "Phạm vi ...")
-    nên phải ghép lại mới nhận ra được heading.
+    A PDF exported from Word often splits the section number into its own span
+    ("1." | "Phạm vi ..."), so the spans have to be joined before a heading can
+    be recognised at all.
 
-    Dấu tham chiếu cước chú bị bỏ hẳn: nó là một span chữ số cỡ nhỏ nằm lọt
-    giữa dòng, ghép thẳng vào thì dính liền vào chữ ("…từng thời kỳ6.") và hệ
-    RAG đọc ra một con số không hề có trong câu.
+    Footnote reference marks are dropped entirely: such a mark is a small numeric
+    span sitting mid-line, and joining it straight in glues it to the word
+    ("…từng thời kỳ6."), leaving the RAG stack to read a number that is not in
+    the sentence.
     """
     main = _dominant_size(line["spans"])
     parts = []
@@ -193,15 +206,15 @@ def _line_text(line: dict) -> str:
         if not t:
             continue
         if _is_ref_mark(span, main):
-            # coi như dấu tham chiếu chưa từng có mặt: span kế tiếp nối thẳng
-            # vào span trước nó, không sinh thêm khoảng trắng giả
+            # act as if the reference mark was never there: the next span joins
+            # straight onto the previous one, with no phantom space between
             prev_end = span["bbox"][2]
             after_ref = True
             continue
         if after_ref:
             t = t.lstrip()
             after_ref = False
-        # khoảng trống ngang đáng kể giữa 2 span -> chèn dấu cách
+        # a noticeable horizontal gap between two spans -> insert a space
         elif prev_end is not None and span["bbox"][0] - prev_end > 1.5:
             parts.append(" ")
         parts.append(t)
@@ -211,16 +224,17 @@ def _line_text(line: dict) -> str:
 
 def _footnote_cutoff(blocks: list[Block], height: float,
                      body_size: float) -> float | None:
-    """Toạ độ y nơi khối cước chú cuối trang bắt đầu, None nếu trang không có.
+    """The y coordinate where the page's footnote block starts, None if it has none.
 
-    Cước chú không phải nội dung của mục nào: nó là chú thích của một chỗ nào
-    đó trong thân bài, in cỡ chữ nhỏ dưới một đường kẻ ngang cuối trang. Giữ
-    lại thì dòng "1 Theo địa giới hành chính cũ…" trông y hệt một đề mục đánh
-    số, và cả nhánh nội dung phía sau bị treo nhầm xuống dưới nó.
+    A footnote is not the content of any section: it annotates some point in the
+    body, set small under a horizontal rule at the foot of the page. Kept, a line
+    like "1 Theo địa giới hành chính cũ…" looks exactly like a numbered heading,
+    and the entire branch of content after it is hung underneath it by mistake.
 
-    Quét ngược từ đáy trang lên, gom mạch chữ nhỏ liên tục cuối cùng. Chỉ cắt
-    khi trong mạch đó có ít nhất một dòng mở đầu bằng dấu tham chiếu — đoạn
-    nội dung bình thường in cỡ nhỏ ở cuối trang thì không có dấu ấy.
+    The scan runs upward from the bottom of the page, gathering the last
+    unbroken run of small text. It only cuts when that run holds at least one
+    line opening with a reference mark — an ordinary passage set small at the
+    foot of a page has no such mark.
     """
     limit = body_size - FOOTNOTE_SIZE_GAP
     zone = height * FOOTNOTE_ZONE
@@ -236,12 +250,12 @@ def _footnote_cutoff(blocks: list[Block], height: float,
 
 
 def _collect_repeats(doc: fitz.Document) -> set[str]:
-    """Tìm các dòng lặp ở đầu/cuối trang để loại bỏ.
+    """Find the repeated header/footer lines so they can be stripped.
 
-    Hai điều kiện, phải có cả hai: dòng xuất hiện trên phần lớn số trang, **và**
-    lần nào cũng ở đúng một toạ độ. Riêng điều kiện thứ nhất thì chưa đủ — một
-    câu dẫn chiếu hay lặp cũng thoả — còn thêm điều kiện thứ hai vào thì chỉ
-    còn đúng thứ được đặt trong khung đầu/chân trang.
+    Two conditions, both required: the line appears on most pages, **and** every
+    time at exactly the same coordinate. The first alone is not enough — a
+    frequently repeated cross-reference satisfies it too — but adding the second
+    leaves only what was actually placed in the header/footer frame.
     """
     spots: dict[str, list[float]] = {}
     pages = doc.page_count
@@ -256,8 +270,8 @@ def _collect_repeats(doc: fitz.Document) -> set[str]:
                 if HEADER_ZONE < ratio < REPEAT_ZONE:
                     continue
                 t = _line_text(line)
-                # Số trang thì mỗi trang một khác, nhưng `_norm_key` xoá hết
-                # chữ số nên "1/5" và "2/5" cùng quy về "#/#" — vẫn bắt được.
+                # Page numbers differ on every page, but `_norm_key` erases all
+                # digits, so "1/5" and "2/5" both fold to "#/#" and are caught.
                 if not t or (len(t) < 3 and not _PAGE_NUM.match(t)):
                     continue
                 seen.setdefault(_norm_key(t), ratio)
@@ -270,11 +284,12 @@ def _collect_repeats(doc: fitz.Document) -> set[str]:
 
 
 def is_boilerplate(text: str, ratio: float, repeats: set[str]) -> bool:
-    """Dòng này có phải đầu/chân trang không? `ratio` là y0 chia chiều cao trang.
+    """Is this line a header or footer? `ratio` is y0 divided by the page height.
 
-    Dòng lặp lại đúng một chỗ được xét trên dải rộng; các câu chân trang quen
-    mặt và số trang thì chỉ xét sát mép, vì bản thân chúng cũng xuất hiện trong
-    thân bài (ô "Trang 5" của bảng mục lục chẳng hạn).
+    Lines repeating at exactly one spot are judged over the wide band; the
+    familiar footer phrases and page numbers are judged only near the edges,
+    because they also occur in the body (a "Trang 5" cell in a table of contents,
+    for instance).
     """
     if (ratio <= HEADER_ZONE or ratio >= REPEAT_ZONE) and _norm_key(text) in repeats:
         return True
@@ -287,17 +302,17 @@ _TOC_TITLE = re.compile(r"^\s*(mục lục|nội dung|table of contents|contents
 
 
 def _toc_cutoff(blocks: list[Block]) -> float | None:
-    """Xác định mục lục bắt đầu từ toạ độ y nào trên trang.
+    """Find the y coordinate at which the table of contents starts on a page.
 
-    Nhiều tài liệu đặt bìa và mục lục chung một trang. Bỏ cả trang sẽ mất luôn
-    tên sản phẩm và số văn bản phê chuẩn ở phần bìa, nên chỉ cắt từ chỗ mục lục
-    trở xuống.
+    Plenty of documents put the cover and the table of contents on one page.
+    Dropping the whole page would also lose the product name and the approval
+    document number on the cover, so the cut starts at the table of contents.
     """
     leaders = [b for b in blocks if _DOT_LEADER.search(b.text)]
     if len(leaders) < 4:
         return None
     start = min(b.meta.get("y", 0) for b in leaders)
-    # tiêu đề "MỤC LỤC" nằm ngay trên khối dấu chấm dẫn thì cắt từ đó
+    # if a "MỤC LỤC" heading sits right above the dot-leader block, cut from there
     for b in blocks:
         y = b.meta.get("y", 0)
         if _TOC_TITLE.match(b.text) and y <= start:
@@ -306,12 +321,13 @@ def _toc_cutoff(blocks: list[Block]) -> float | None:
 
 
 def _ref_mark_fixes(page: fitz.Page) -> list[tuple[str, str]]:
-    """Các cặp (chữ liền trước, dấu tham chiếu cước chú) trên một trang.
+    """The (preceding text, footnote reference mark) pairs found on a page.
 
-    PyMuPDF trích bảng thẳng ra chuỗi, không còn thông tin span để nhận ra dấu
-    tham chiếu, nên ô bảng giữ nguyên "…từng thời kỳ6.". Ghi lại vài ký tự
-    đứng ngay trước mỗi dấu ở bước đọc span thì sau đó gỡ nó ra khỏi text của ô
-    được — mà không đụng tới những con số thật sự thuộc về câu.
+    PyMuPDF extracts tables straight to strings, with no span information left to
+    recognise a reference mark, so a table cell keeps "…từng thời kỳ6.". Recording
+    the few characters immediately before each mark during the span pass makes it
+    possible to strip it from the cell text afterwards — without touching numbers
+    that genuinely belong to the sentence.
     """
     fixes: list[tuple[str, str]] = []
     for block in _page_dict(page)["blocks"]:
@@ -354,7 +370,7 @@ def _table_markdown(tbl, ref_fixes: list[tuple[str, str]]) -> str:
 
 
 def _body_size(doc: fitz.Document) -> float:
-    """Cỡ chữ phổ biến nhất — dùng làm mốc nhận biết tiêu đề lớn."""
+    """The most common font size — the baseline for spotting large headings."""
     counter: Counter[float] = Counter()
     for page in doc:
         for block in _page_dict(page)["blocks"]:
@@ -373,9 +389,9 @@ def extract(path: str, figure_dir: str | None = None, doc_id: str = "doc",
     repeats = _collect_repeats(doc)
     body_size = _body_size(doc)
 
-    # Logo bị loại thẳng; hình minh hoạ được giữ chỗ bằng một dòng mô tả
+    # Logos are dropped outright; figures get a descriptive placeholder line
     images = collect_pdf_images(doc)
-    # Lưu đồ vẽ bằng nét cũng là hình, dù không có ảnh nào nhúng trong file
+    # A vector flowchart is a figure too, even with no image embedded in the file
     for page in doc:
         for figure in collect_vector_figures(page):
             images.setdefault(figure.page, []).append(figure)
@@ -387,10 +403,10 @@ def extract(path: str, figure_dir: str | None = None, doc_id: str = "doc",
         stats["figures_found"] = sum(1 for i in flat if i.kind == "figure")
         stats["diagrams_found"] = sum(1 for i in flat if i.meta.get("vector"))
         stats["boilerplate_lines_dropped"] = len(repeats)
-        # Bản scan: mỗi trang là một tấm ảnh chụp, không có lớp text. Chữ, logo,
-        # đầu/chân trang đều là điểm ảnh nằm chung trong một tấm hình duy nhất
-        # — không có đối tượng riêng nào để gỡ, mà gỡ tấm hình đó thì trang
-        # trắng trơn. Đếm ra đây để báo cho người dùng biết phải OCR trước.
+        # A scan: every page is one photograph with no text layer. Text, logo,
+        # header and footer are all pixels inside a single image — there is no
+        # separate object to strip, and stripping that image leaves a blank page.
+        # Counted here so the user can be told to run OCR first.
         stats["pages_total"] = doc.page_count
         stats["pages_without_text"] = sum(
             1 for page in doc if len(page.get_text("text").strip()) < SCAN_PAGE_CHARS)
@@ -402,16 +418,17 @@ def extract(path: str, figure_dir: str | None = None, doc_id: str = "doc",
         height = page.rect.height
         ref_fixes = _ref_mark_fixes(page)
 
-        # Chữ nằm trong một sơ đồ là nhãn của các ô trong sơ đồ đó, không phải
-        # nội dung đọc theo dòng. Moi ra thì được một chuỗi vô nghĩa mà bản thân
-        # sơ đồ cũng mất luôn — giữ nguyên nó ở dạng ảnh mới đúng.
+        # Text inside a diagram labels that diagram's boxes; it is not content to
+        # be read line by line. Pulling it out yields a meaningless string and
+        # loses the diagram itself — keeping it as an image is the right answer.
         #
-        # Chỉ bỏ chữ khi đã xuất được ảnh: không có ảnh thay thế thì thà giữ
-        # chữ lộn xộn còn hơn mất trắng cả khối nội dung.
+        # The text is only dropped once the image has been exported: with no
+        # image to stand in its place, jumbled text beats losing the block
+        # entirely.
         diagrams = [fitz.Rect(i.bbox) for i in images.get(pno, [])
                     if i.meta.get("vector") and i.file]
 
-        # Vùng bảng được xử lý riêng; các dòng nằm trong đó sẽ bị bỏ qua
+        # Table areas are handled separately; lines inside them are skipped
         table_boxes: list[fitz.Rect] = []
         table_blocks: list[Block] = []
         try:
@@ -420,8 +437,8 @@ def extract(path: str, figure_dir: str | None = None, doc_id: str = "doc",
                 if md:
                     rect = fitz.Rect(tbl.bbox)
                     table_boxes.append(rect)
-                    # Lưu đồ có khung kẻ nên `find_tables` nhận nhầm nó thành
-                    # một cái bảng khổng lồ một ô.
+                    # A flowchart has a ruled frame, so `find_tables` mistakes it
+                    # for one enormous single-cell table.
                     if any(rect.get_area() and (rect & d).get_area()
                            > 0.6 * rect.get_area() for d in diagrams):
                         continue
@@ -447,7 +464,7 @@ def extract(path: str, figure_dir: str | None = None, doc_id: str = "doc",
                 if is_boilerplate(text, ratio, repeats):
                     continue
                 in_margin = ratio <= HEADER_ZONE or ratio >= FOOTER_ZONE
-                # số trang lẫn vào giữa dòng chân trang, vd "Quy định sản phẩm 3/8"
+                # a page number buried in a footer line, e.g. "Quy định sản phẩm 3/8"
                 if in_margin and len(text) < 90 and _PAGE_NUM.search(text.split()[-1] if text.split() else ""):
                     stripped = _norm_key(re.sub(r"\s*\d+\s*/\s*\d+\s*$", "", text))
                     if stripped in repeats:
@@ -456,13 +473,13 @@ def extract(path: str, figure_dir: str | None = None, doc_id: str = "doc",
                 if any(mid in r for r in table_boxes):
                     continue
                 if any(mid in r for r in diagrams):
-                    continue        # nhãn bên trong sơ đồ, đã nằm trong ảnh
+                    continue        # a label inside a diagram, already in the image
 
                 spans = [s for s in line["spans"] if s["text"].strip()]
                 if not spans:
                     continue
                 size = max(s["size"] for s in spans)
-                # coi là đậm khi phần lớn ký tự trong dòng ở dạng đậm
+                # treat the line as bold when most of its characters are bold
                 bold_chars = sum(len(s["text"]) for s in spans if s["flags"] & BOLD_FLAG)
                 total_chars = sum(len(s["text"]) for s in spans)
                 bold = total_chars > 0 and bold_chars / total_chars >= 0.6
@@ -473,15 +490,15 @@ def extract(path: str, figure_dir: str | None = None, doc_id: str = "doc",
                           "ref_start": _starts_with_ref_mark(line)},
                 ))
 
-        # Cắt bỏ khối cước chú ở cuối trang trước khi nối dòng: để lại thì các
-        # dòng cước chú nối tiếp nhau thành một đoạn dài giả.
+        # Cut the footnote block off the foot of the page before joining lines:
+        # left in, the footnote lines join into one long phantom paragraph.
         note_at = _footnote_cutoff(candidates, height, body_size)
         if note_at is not None:
             kept = [b for b in candidates if b.meta.get("y", 0) < note_at]
             footnote_lines += len(candidates) - len(kept)
             candidates = kept
 
-        # Cắt bỏ phần mục lục nhưng giữ nội dung nằm phía trên nó trên cùng trang
+        # Cut the table of contents but keep the content above it on that page
         cutoff = _toc_cutoff(candidates)
         if cutoff is not None:
             candidates = [b for b in candidates if b.meta.get("y", 0) < cutoff]
@@ -490,8 +507,9 @@ def extract(path: str, figure_dir: str | None = None, doc_id: str = "doc",
         merged = _merge_wrapped(_join_same_row(candidates))
         merged.extend(table_blocks)
 
-        # Giữ chỗ cho hình minh hoạ đúng vị trí của nó trong mạch nội dung,
-        # để chunk biết mục này có hình mà không nuốt mất logo vào text.
+        # Reserve a figure's place at exactly its position in the flow of the
+        # content, so a chunk knows the section carries a figure without swallowing
+        # a logo into its text.
         for img in images.get(pno, []):
             if img.kind != "figure":
                 continue
@@ -517,11 +535,12 @@ def extract(path: str, figure_dir: str | None = None, doc_id: str = "doc",
 
 
 def _join_same_row(lines: list[Block]) -> list[Block]:
-    """Gộp các mảnh nằm trên cùng một hàng ngang.
+    """Merge fragments that sit on the same horizontal row.
 
-    Trong PDF, ký hiệu đầu mục ("a.", "(i)", "-") thường được đặt ở cột lề
-    riêng nên PyMuPDF tách thành dòng độc lập. Nếu không gộp lại, ta có block
-    rác chỉ chứa "a." còn nội dung thì mất ký hiệu đầu mục.
+    In a PDF the item marker ("a.", "(i)", "-") is usually placed in its own
+    margin column, so PyMuPDF splits it into a separate line. Without merging,
+    the result is a junk block holding only "a." while the content loses its
+    marker.
     """
     rows: list[list[Block]] = []
     for blk in sorted(lines, key=lambda b: (b.meta.get("y", 0), b.meta.get("x0", 0))):
@@ -541,7 +560,7 @@ def _join_same_row(lines: list[Block]) -> list[Block]:
         head.text = clean_text(" ".join(b.text for b in row))
         head.bold = any(b.bold for b in row)
         head.size = max(b.size for b in row)
-        # giữ lề của phần nội dung để bước nối dòng phía sau canh đúng
+        # keep the content's left edge so the later line-joining step aligns right
         body = next((b for b in row[1:] if len(b.text) > 4), None)
         if body is not None:
             head.meta["x0"] = body.meta.get("x0", head.meta.get("x0"))
@@ -550,10 +569,10 @@ def _join_same_row(lines: list[Block]) -> list[Block]:
 
 
 def _merge_wrapped(lines: list[Block]) -> list[Block]:
-    """Nối các dòng bị xuống hàng do tràn lề thành một đoạn văn hoàn chỉnh.
+    """Join lines wrapped by the margin back into complete paragraphs.
 
-    PDF lưu từng dòng hiển thị, không lưu đoạn văn. Nếu không nối lại, mỗi
-    dòng thành một block rời rạc và câu bị cắt giữa chừng khi chunk.
+    A PDF stores rendered lines, not paragraphs. Without joining, every line
+    becomes a separate block and sentences are cut mid-way during chunking.
     """
     out: list[Block] = []
     for blk in lines:
@@ -564,21 +583,22 @@ def _merge_wrapped(lines: list[Block]) -> list[Block]:
         same_style = prev.bold == blk.bold and abs(prev.size - blk.size) < 0.6
         indent = blk.meta.get("x0", 0) - prev.meta.get("x0", 0)
         aligned = abs(indent) < 12
-        # Đoạn có chỉ mục dùng lề treo: dòng thứ hai trở đi thụt vào đúng bằng
-        # bề rộng của chỉ mục ("15.10. " ~ 32pt). Đòi hai dòng thẳng lề nhau thì
-        # tiêu đề dài hai dòng không bao giờ được nối, và nửa sau của nó ("liệu
-        # sản xuất") rơi xuống thành một đoạn nội dung cụt lủn.
+        # A numbered paragraph uses a hanging indent: from the second line on it
+        # is indented by exactly the width of the number ("15.10. " ~ 32pt).
+        # Demanding that two lines share a left edge means a two-line heading is
+        # never joined, and its second half drops down as a stunted paragraph.
         hanging = 0 < indent <= HANGING_INDENT_PT and bool(_ITEM_START.match(prev.text))
         gap = blk.meta.get("y", 0) - prev.meta.get("y", 0)
-        # dòng trước chưa kết thúc câu và dòng này không mở đầu mục mới
+        # the previous line has not finished its sentence and this one opens no item
         unfinished = not re.search(r"[.:;!?]$", prev.text)
         starts_new = bool(_ITEM_START.match(blk.text))
         near = 0 < gap < prev.size * 2.2
 
-        # Từ bị gạch nối cắt đôi ở cuối dòng ("…và Dai-" / "ichi Life Việt
-        # Nam…"). Phải nối kể cả khi hai dòng khác kiểu chữ: dòng đầu của một
-        # mục thường in đậm phần tên, dòng sau thì không, nên điều kiện cùng
-        # kiểu chữ ở dưới không bao giờ đúng và từ cứ nằm đứt đôi.
+        # A word split by a hyphen at the end of a line ("…và Dai-" / "ichi Life
+        # Việt Nam…"). These must join even when the two lines differ in style:
+        # an item's first line usually sets the name in bold and the next does
+        # not, so the same-style condition below never holds and the word stays
+        # broken in half.
         if (near and not starts_new
                 and re.search(r"\w-$", prev.text) and blk.text[:1].islower()):
             prev.text = clean_text(prev.text + blk.text)

@@ -220,7 +220,7 @@ def test_figure_placeholder_format():
     img = DocImage(page=2, bbox=(0, 0, 300, 200), width=300, height=200,
                    kind="figure", reason="test", caption="Biểu đồ 1: Doanh thu")
     text = img.placeholder()
-    assert text.startswith("[HÌNH:")
+    assert text.startswith("[FIGURE:")
     assert "Biểu đồ 1" in text and "300x200" in text
 
 
@@ -232,7 +232,7 @@ def test_logos_are_dropped_and_not_in_text(processed):
     for _path, chunks, _sections, _src, _st in processed:
         for chunk in chunks:
             for line in chunk.raw_text.split("\n"):
-                if line.strip().startswith("[HÌNH:"):
+                if line.strip().startswith("[FIGURE:"):
                     continue
                 assert ".png" not in line.lower() and ".jpeg" not in line.lower()
 
@@ -243,7 +243,7 @@ def test_figures_are_kept_with_metadata(processed):
     assert with_fig, "không giữ được hình minh hoạ nào"
     for chunk in with_fig:
         assert chunk.figures
-        assert "[HÌNH:" in chunk.raw_text
+        assert "[FIGURE:" in chunk.raw_text
         for fig in chunk.figures:
             assert fig["width"] and fig["height"]
 
@@ -251,7 +251,7 @@ def test_figures_are_kept_with_metadata(processed):
 def test_figure_flag_matches_content(processed):
     for _path, chunks, _sections, _src, _st in processed:
         for chunk in chunks:
-            if "[HÌNH:" in chunk.raw_text:
+            if "[FIGURE:" in chunk.raw_text:
                 assert chunk.has_figure, f"{chunk.chunk_id} có hình nhưng không đánh dấu"
 
 
@@ -2016,7 +2016,7 @@ def test_flowchart_is_kept_as_a_picture(tmp_path):
     chunks, _sections, _src = process_file(
         path, CFG, figure_dir=str(tmp_path / "figures"))
     body = " ".join(c.raw_text for c in chunks)
-    assert "[HÌNH:" in body, "lưu đồ không để lại dòng giữ chỗ nào"
+    assert "[FIGURE:" in body, "lưu đồ không để lại dòng giữ chỗ nào"
     # chữ trong ô của lưu đồ không được moi ra thành nội dung
     assert "Tiếp nhận và khai báo" not in body
 

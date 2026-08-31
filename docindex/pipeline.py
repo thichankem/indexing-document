@@ -1,4 +1,4 @@
-"""Ghép các bước xử lý thành một luồng hoàn chỉnh cho từng file."""
+"""Wires the processing steps into one complete pass over a single file."""
 from __future__ import annotations
 
 import hashlib
@@ -14,7 +14,7 @@ SUPPORTED = {".pdf", ".docx"}
 
 
 def make_doc_id(path: str) -> str:
-    """Mã tài liệu ổn định: tên file rút gọn + băm đường dẫn."""
+    """Stable document id: a slug of the file name plus a hash of the path."""
     name = os.path.splitext(os.path.basename(path))[0]
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower()[:48]
     digest = hashlib.sha1(os.path.abspath(path).encode("utf-8")).hexdigest()[:8]
@@ -35,7 +35,7 @@ def process_file(path: str, cfg: ChunkConfig | None = None,
             path, figure_dir=figure_dir, doc_id=doc_id, stats=stats)
         source = "docx"
     else:
-        raise ValueError(f"Định dạng chưa hỗ trợ: {ext}")
+        raise ValueError(f"Unsupported format: {ext}")
 
     cfg = cfg or ChunkConfig()
     blocks = detect_headings(blocks, source)
@@ -57,7 +57,7 @@ def iter_input_files(folder: str) -> list[str]:
     for root, _dirs, files in os.walk(folder):
         for name in sorted(files):
             if name.startswith("~$"):
-                continue  # file tạm của Word
+                continue  # Word temporary file
             if os.path.splitext(name)[1].lower() in SUPPORTED:
                 out.append(os.path.join(root, name))
     return out

@@ -1,8 +1,8 @@
-"""Tiện ích dùng lại metadata lúc truy vấn.
+"""Helpers that reuse chunk metadata at query time.
 
-Chunk được cắt nhỏ để tìm kiếm cho chính xác, nhưng khi đưa cho LLM trả lời
-thì cần đủ ngữ cảnh. Hai hàm dưới đây khôi phục lại phần nội dung bị cắt do
-ranh giới trang.
+Chunks are kept small so retrieval stays precise, but the answer an LLM writes
+needs the full context. The functions below restore the content that was split
+across page boundaries.
 """
 from __future__ import annotations
 
@@ -19,10 +19,10 @@ def index_by_id(chunks: list[dict]) -> dict[str, dict]:
 
 
 def expand_section(chunk: dict, by_id: dict[str, dict], max_parts: int = 6) -> str:
-    """Ghép lại toàn bộ các phần của cùng một mục quanh chunk đã tìm được.
+    """Reassemble every part of the section surrounding the retrieved chunk.
 
-    Dùng khi chunk khớp truy vấn có is_continued/is_continuation = True: một
-    mình nó chỉ là một nửa nội dung của mục.
+    Use it when the matching chunk has is_continued/is_continuation = True: on
+    its own such a chunk holds only part of the section.
     """
     parts = [chunk]
 
@@ -48,7 +48,7 @@ def expand_section(chunk: dict, by_id: dict[str, dict], max_parts: int = 6) -> s
 
 
 def neighbours(chunk: dict, by_id: dict[str, dict], window: int = 1) -> list[dict]:
-    """Lấy các chunk liền kề bất kể cùng mục hay không (mở rộng ngữ cảnh rộng)."""
+    """Return neighbouring chunks regardless of section (a wider context window)."""
     out = [chunk]
     node = chunk
     for _ in range(window):

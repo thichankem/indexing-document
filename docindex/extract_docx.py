@@ -1,4 +1,4 @@
-"""Đọc file .docx thành danh sách Block theo đúng thứ tự tài liệu."""
+"""Read a .docx file into a list of Blocks in document order."""
 from __future__ import annotations
 
 import os
@@ -11,12 +11,12 @@ from docx.text.paragraph import Paragraph
 from .models import Block, clean_text, rows_to_markdown
 from .numbering import NUMERIC_FORMATS, NumberingResolver
 
-# Số ký tự ước lượng cho một trang A4 khi tài liệu không có dấu ngắt trang
+# Estimated characters per A4 page, used when the document has no page breaks
 CHARS_PER_PAGE = 2200
 
 
 def _iter_body(document):
-    """Duyệt paragraph và table xen kẽ nhau theo đúng thứ tự trong file."""
+    """Walk paragraphs and tables interleaved, in the order they appear in the file."""
     body = document.element.body
     for child in body.iterchildren():
         if child.tag == qn("w:p"):
@@ -26,7 +26,7 @@ def _iter_body(document):
 
 
 def _num_pr(paragraph: Paragraph) -> tuple[str | None, int | None]:
-    """Lấy (numId, ilvl) từ paragraph, kể cả khi được thừa kế từ style."""
+    """Read (numId, ilvl) off a paragraph, including values inherited from a style."""
     pPr = paragraph._p.pPr
     if pPr is not None and pPr.numPr is not None:
         num_id = pPr.numPr.numId.val if pPr.numPr.numId is not None else None
@@ -34,7 +34,7 @@ def _num_pr(paragraph: Paragraph) -> tuple[str | None, int | None]:
         if num_id is not None:
             return str(num_id), int(ilvl or 0)
 
-    # numbering có thể khai báo ở style thay vì trực tiếp trên paragraph
+    # numbering may be declared on the style rather than on the paragraph itself
     style = paragraph.style
     seen = set()
     while style is not None and style.style_id not in seen:
@@ -57,7 +57,7 @@ def _num_pr(paragraph: Paragraph) -> tuple[str | None, int | None]:
 
 
 def _has_page_break(paragraph: Paragraph) -> bool:
-    """Dấu ngắt trang do người dùng chèn."""
+    """A page break the author inserted by hand."""
     for br in paragraph._p.iter(qn("w:br")):
         if br.get(qn("w:type")) == "page":
             return True
@@ -65,19 +65,19 @@ def _has_page_break(paragraph: Paragraph) -> bool:
 
 
 def _rendered_breaks(paragraph: Paragraph) -> int:
-    """Dấu ngắt trang Word ghi lại ở lần mở file gần nhất — khá sát thực tế."""
+    """Page breaks Word recorded the last time the file was opened — fairly accurate."""
     return len(list(paragraph._p.iter(qn("w:lastRenderedPageBreak"))))
 
 
-EMU_PER_PT = 12700          # 1 pt = 12700 EMU trong OOXML
-MIN_FIGURE_SIDE_PT = 70     # nhỏ hơn ngưỡng này coi là logo/biểu tượng
+EMU_PER_PT = 12700          # 1 pt = 12700 EMU in OOXML
+MIN_FIGURE_SIDE_PT = 70     # anything smaller is treated as a logo or icon
 
 
 def _paragraph_images(paragraph: Paragraph) -> list[dict]:
-    """Lấy ảnh nhúng trong một paragraph kèm kích thước thật (đơn vị pt).
+    """Return the images embedded in a paragraph with their real size in points.
 
-    Ảnh ở header/footer nằm ngoài body nên không lọt vào đây — đúng ý đồ, vì
-    đó thường là logo.
+    Header/footer images live outside the body, so they never reach this code —
+    which is exactly the intent, since those are usually logos.
     """
     out: list[dict] = []
     for drawing in paragraph._p.iter(qn("w:drawing")):
@@ -100,7 +100,10 @@ def _paragraph_images(paragraph: Paragraph) -> list[dict]:
 
 
 def _save_image(paragraph: Paragraph, rid: str | None, dst_base: str) -> str:
-    """Ghi ảnh nhúng ra file để dựng lại tài liệu vẫn còn hình. Trả về đường dẫn."""
+    """Write an embedded image to disk so the rebuilt document still has it.
+
+    Returns the path it was written to.
+    """
     if not rid:
         return ""
     try:
@@ -120,16 +123,16 @@ def _classify_docx_image(img: dict) -> str:
     if w and h and min(w, h) < MIN_FIGURE_SIDE_PT:
         return "logo"
     if not w or not h:
-        return "logo"      # không xác định được kích thước -> nhiều khả năng là hoạ tiết
+        return "logo"      # size unknown -> most likely an ornament
     return "figure"
 
 
 def _table_page_breaks(table: Table) -> int:
-    """Số lần bảng bị ngắt sang trang mới.
+    """How many times the table breaks onto a new page.
 
-    Word đặt lastRenderedPageBreak vào mọi ô của hàng đầu tiên sau chỗ ngắt,
-    nên phải đếm theo hàng chứ không đếm marker, nếu không số trang sẽ phồng
-    lên gấp số cột.
+    Word puts lastRenderedPageBreak into every cell of the first row after the
+    break, so rows have to be counted rather than markers — otherwise the page
+    count inflates by the number of columns.
     """
     rows_with_break = 0
     for tr in table._tbl.iter(qn("w:tr")):
@@ -139,7 +142,7 @@ def _table_page_breaks(table: Table) -> int:
 
 
 def _para_style(paragraph: Paragraph) -> tuple[bool, float]:
-    """Trả về (in đậm, cỡ chữ) lấy từ run đầu tiên có nội dung."""
+    """Return (bold, font size) taken from the first run that holds content."""
     for run in paragraph.runs:
         if not run.text.strip():
             continue
@@ -159,13 +162,13 @@ def _para_style(paragraph: Paragraph) -> tuple[bool, float]:
 
 
 def _table_to_markdown(table: Table) -> str:
-    """Chuyển bảng sang markdown để giữ được quan hệ hàng/cột khi embed."""
+    """Convert a table to markdown so the row/column relationship survives embedding."""
     rows: list[list[str]] = []
     for row in table.rows:
         cells: list[str] = []
         seen_tc = set()
         for cell in row.cells:
-            # ô gộp (merge) lặp lại cùng một _tc -> chỉ lấy một lần
+            # merged cells repeat the same _tc -> take it only once
             if cell._tc in seen_tc:
                 continue
             seen_tc.add(cell._tc)
@@ -177,12 +180,12 @@ def _table_to_markdown(table: Table) -> str:
 
 def extract(path: str, figure_dir: str | None = None, doc_id: str = "doc",
             stats: dict | None = None) -> tuple[list[Block], str]:
-    """Trả về (danh sách block, nguồn số trang)."""
+    """Return (list of blocks, page-number source)."""
     document = docx.Document(path)
     resolver = NumberingResolver(document)
     logos = figures = 0
 
-    # Nếu Word có ghi lastRenderedPageBreak thì số trang bám sát bản in thật
+    # When Word recorded lastRenderedPageBreak, page numbers track the real print
     total_rendered = len(list(document.element.body.iter(qn("w:lastRenderedPageBreak"))))
     use_rendered = total_rendered > 0
 
@@ -193,9 +196,9 @@ def extract(path: str, figure_dir: str | None = None, doc_id: str = "doc",
     for item in _iter_body(document):
         if isinstance(item, Table):
             md = _table_to_markdown(item)
-            # Bảng dài thường trải nhiều trang: dấu ngắt trang nằm bên trong ô,
-            # phải cộng vào trước khi gán trang cho bảng, nếu không mọi nội dung
-            # phía sau sẽ bị dồn nhầm về trang đầu.
+            # Long tables usually span several pages: the page breaks sit inside
+            # the cells, so they have to be added before the table is assigned a
+            # page, or everything after it is misfiled onto the first page.
             breaks_inside = _table_page_breaks(item)
             if md:
                 chars_on_page += len(md)
@@ -214,26 +217,26 @@ def extract(path: str, figure_dir: str | None = None, doc_id: str = "doc",
         text = clean_text(para.text)
 
         if use_rendered:
-            # ngắt trang được ghi nhận ngay tại paragraph này -> sang trang mới
+            # a page break was recorded at this paragraph -> move to a new page
             page += _rendered_breaks(para)
         elif _has_page_break(para):
             page += 1
             chars_on_page = 0
 
-        # Hình minh hoạ được giữ chỗ; logo bị bỏ qua vì chỉ làm loãng vector
+        # Figures get a placeholder; logos are skipped, they only dilute the vector
         for img in _paragraph_images(para):
             if _classify_docx_image(img) != "figure":
                 logos += 1
                 continue
             figures += 1
-            label = img["name"] or "Hình minh hoạ"
+            label = img["name"] or "Figure"
             saved = ""
             if figure_dir:
                 saved = _save_image(
                     para, img.get("rid"),
                     os.path.join(figure_dir, f"{doc_id}_p{page}_{figures}"))
             blocks.append(Block(
-                text=f"[HÌNH: {label} | {img['width']}x{img['height']}]",
+                text=f"[FIGURE: {label} | {img['width']}x{img['height']}]",
                 page=page, kind="figure",
                 meta={"figure": True, "caption": img["name"],
                       "width": img["width"], "height": img["height"], "file": saved},
@@ -267,11 +270,11 @@ def extract(path: str, figure_dir: str | None = None, doc_id: str = "doc",
     if stats is not None:
         stats["logos_dropped"] = logos
         stats["figures_found"] = figures
-        # Lưu đồ trong DOCX là đối tượng vẽ của Word, không phải nét trên trang
-        # giấy như ở PDF — chưa nhận diện được.
+        # A diagram in DOCX is a Word drawing object, not strokes on the page as
+        # in a PDF — not detected yet.
         stats["diagrams_found"] = 0
-        # Header/footer và cước chú của Word nằm ngoài body (header*.xml,
-        # footnotes.xml) nên không bao giờ lọt vào chunk
+        # Word keeps headers, footers and footnotes outside the body
+        # (header*.xml, footnotes.xml), so they never reach a chunk
         stats["boilerplate_lines_dropped"] = 0
         stats["footnote_lines_dropped"] = 0
 

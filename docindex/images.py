@@ -1,8 +1,9 @@
-"""Phân loại ảnh trong tài liệu: logo trang trí hay hình minh hoạ nội dung.
+"""Classify the images in a document: decorative logo or content figure.
 
-Logo và hoạ tiết lặp ở đầu/cuối trang là nhiễu — đưa vào chunk chỉ làm loãng
-vector. Ngược lại, biểu đồ và sơ đồ là nội dung thật, phải giữ chỗ để biết ở
-mục nào có hình, kèm đường dẫn file ảnh đã tách ra.
+Logos and ornaments repeated at the top or bottom of every page are pure noise
+— put them in a chunk and they only dilute the vector. Charts and diagrams, on
+the other hand, are real content: they need a placeholder so the section is
+known to carry a figure, plus the path of the extracted image file.
 """
 from __future__ import annotations
 
@@ -13,55 +14,61 @@ from dataclasses import dataclass, field
 
 import fitz
 
-# Ảnh nhỏ hơn ngưỡng này gần như chắc chắn là logo, biểu tượng hoặc gạch trang trí
-MIN_FIGURE_AREA_RATIO = 0.025    # 2.5% diện tích trang
-MIN_FIGURE_SIDE = 70             # điểm ảnh, cạnh ngắn nhất
+# An image smaller than these is almost certainly a logo, an icon or a rule
+MIN_FIGURE_AREA_RATIO = 0.025    # 2.5% of the page area
+MIN_FIGURE_SIDE = 70             # pixels, shortest side
 MARGIN_TOP = 0.12
 MARGIN_BOTTOM = 0.88
-# Cùng một ảnh lặp trên nhiều trang thì đó là yếu tố thương hiệu, không phải nội dung
+# The same image on several pages is branding, not content
 REPEAT_PAGES = 2
 
-# Hoa văn chìm — bàn tay đỡ chiếc khiên, chiếc lá, quả địa cầu in mờ giữa trang —
-# to bằng cả nửa trang nên lọt hết mọi ngưỡng kích thước, không lặp lại nên cũng
-# thoát luôn phép đếm số trang. Cái nó không có là **nét đậm**: hoa văn in mờ để
-# chữ đè lên vẫn đọc được, còn biểu đồ hay lưu đồ thì bắt buộc phải có mực đậm
-# mới nhìn ra. Đo trên tài liệu thật: hoa văn ≤ 0.02, mọi hình nội dung ≥ 0.17.
-WATERMARK_INK = 170            # dưới mức xám này mới tính là nét đậm
+# A watermark — the hand holding a shield, the leaf, the globe printed faintly
+# across the middle of the page — is half a page wide, so it clears every size
+# threshold, and it prints only once, so the repeat count misses it too. What it
+# does not have is **dark ink**: a watermark has to stay faint for the text on
+# top of it to remain readable, while a chart or a flowchart is unreadable
+# without dark ink. Measured on real documents: watermarks <= 0.02, every
+# content figure >= 0.17.
+WATERMARK_INK = 170            # darker than this grey level counts as dark ink
 WATERMARK_INK_RATIO = 0.05
-WATERMARK_DPI = 72             # thấp hơn thì nét chữ mảnh bị khử răng cưa làm nhạt đi
-NEAR_WHITE = 247               # sáng hơn mức này coi như nền giấy
+WATERMARK_DPI = 72             # lower and anti-aliasing washes out thin strokes
+NEAR_WHITE = 247               # brighter than this counts as paper background
 
-# Khung bo góc màu đỏ vẽ quanh một đoạn văn, dải màu ngang trên đầu mục — phép
-# đo mực ở trên không bắt được chúng, vì nó chia cho *số điểm không phải nền
-# giấy*: khung chỉ có mấy nét đỏ trên nền trong suốt nên gần như 100% số điểm
-# ấy đều là nét đậm, chấm 0.67 ngang với một biểu đồ dày đặc.
+# A rounded red frame drawn around a paragraph, a colour band above a heading —
+# the ink measure above does not catch these, because it divides by the number
+# of *non-paper* pixels: a frame is a few red strokes on a transparent ground,
+# so nearly 100% of those pixels are dark ink and it scores 0.67, level with a
+# dense chart.
 #
-# Dấu hiệu tách được nằm ở chỗ khác: khung được vẽ *dưới* chữ, nên chữ sống của
-# trang nằm đè lên nó. Hình nội dung thì ngược lại — nhãn của biểu đồ, chữ
-# trong từng ô lưu đồ đều nằm sẵn trong chính file ảnh, nên vùng đó không có
-# lấy một ký tự sống nào. Đo trên 60 ảnh đang được giữ: mọi hình nội dung 0 ký
-# tự, mọi khung trang trí 292–523 ký tự.
+# The signal that does separate them is elsewhere: a frame is drawn *under* the
+# text, so the page's live text sits on top of it. A content figure is the
+# opposite — a chart's labels and the text inside each flowchart box live in the
+# image file itself, so that area holds no live characters at all. Measured over
+# 60 kept images: every content figure 0 characters, every decorative frame
+# 292-523.
 TEXT_OVER_IMAGE_CHARS = 40
 
-# Ảnh chụp quảng cáo (mảng ảnh gia đình cắt theo hình cánh quạt ở trang bìa
-# từng phần) không có chữ đè lên nên luật trên không với tới. Cái nó khác hình
-# nội dung là **số màu**: biểu đồ, lưu đồ vẽ bằng mảng màu phẳng, còn ảnh chụp
-# thì chuyển sắc liên tục. Đếm số màu khác nhau khi dựng lại vùng ảnh ở 48 dpi:
+# Marketing photographs (the fan-shaped family collage on a part's cover page)
+# carry no text on top, so the rule above cannot reach them. What separates them
+# from a content figure is the **colour count**: charts and flowcharts are drawn
+# in flat colour areas, a photograph has continuous gradients. Counting distinct
+# colours when the image area is rendered at 48 dpi:
 #
-#   biểu đồ / lưu đồ / khung trang trí   610 – 1 229 màu
-#   ảnh chụp quảng cáo                  39 832 – 48 968 màu
+#   chart / flowchart / decorative frame     610 - 1,229 colours
+#   marketing photograph                  39,832 - 48,968 colours
 #
-# Ngưỡng đặt ở 8 000, cách mép trên 6.5 lần và mép dưới 5 lần.
+# The threshold sits at 8,000 — 6.5x below the upper group, 5x above the lower.
 PHOTO_COLOURS = 8000
 PHOTO_DPI = 48
-# Trang scan cũng là một tấm ảnh chụp cả trang — đo thì rớt, mà gỡ đi là mất
-# trắng nội dung. Trang nào chữ sống ít hơn mức này thì ảnh *chính là* nội dung
-# của trang, không đem ra đo.
+# A scanned page is also one photograph of the whole sheet — it fails the test,
+# and dropping it loses the content entirely. When a page has less live text
+# than this, its image *is* the page content and is not measured at all.
 PAGE_TEXT_FOR_PHOTO_TEST = 200
 
-# Sau từ khoá phải có số thứ tự hoặc dấu hai chấm thì mới là chú thích hình.
-# Nếu để trống cả hai, những câu mở đầu bằng "Hình thức...", "Ảnh hưởng..."
-# sẽ bị nhận nhầm thành chú thích.
+# The keyword must be followed by an index number or a colon to count as a
+# caption. Without either, sentences opening with "Hình thức...", "Ảnh
+# hưởng..." would be mistaken for captions. (Keywords are Vietnamese because
+# the source documents are.)
 CAPTION = re.compile(
     r"^\s*(hình vẽ|hình|biểu đồ|sơ đồ|đồ thị|lưu đồ|ảnh|figure|fig|chart|diagram)"
     r"\s*(?:(\d+|(?-i:[IVX]{1,4}))\s*[:.\-–]?|[:.\-–])\s*(.*)$",
@@ -76,10 +83,10 @@ class DocImage:
     width: float
     height: float
     kind: str                      # figure | logo
-    reason: str                    # vì sao xếp loại như vậy
+    reason: str                    # why it was classified that way
     xref: int = 0
     caption: str = ""
-    file: str = ""                 # đường dẫn ảnh đã tách (nếu có)
+    file: str = ""                 # path of the extracted image, when there is one
     meta: dict = field(default_factory=dict)
 
     @property
@@ -87,16 +94,16 @@ class DocImage:
         return self.bbox[1]
 
     def placeholder(self) -> str:
-        """Dòng giữ chỗ chèn vào nội dung chunk."""
-        label = self.caption or "Hình minh hoạ"
+        """The placeholder line inserted into the chunk body."""
+        label = self.caption or "Figure"
         size = f"{round(self.width)}x{round(self.height)}"
         if self.file:
-            return f"[HÌNH: {label} | {size} | {os.path.basename(self.file)}]"
-        return f"[HÌNH: {label} | {size}]"
+            return f"[FIGURE: {label} | {size} | {os.path.basename(self.file)}]"
+        return f"[FIGURE: {label} | {size}]"
 
 
 def _find_caption(page: fitz.Page, bbox) -> str:
-    """Tìm dòng chú thích ngay dưới (hoặc ngay trên) ảnh."""
+    """Find the caption line right below (or right above) an image."""
     x0, y0, x1, y1 = bbox
     zone = fitz.Rect(x0 - 30, y1, x1 + 30, y1 + 60)
     below = page.get_text("text", clip=zone).strip()
@@ -114,15 +121,16 @@ def _find_caption(page: fitz.Page, bbox) -> str:
 
 
 def dark_ink_ratio(page: fitz.Page, bbox) -> float:
-    """Tỉ lệ điểm ảnh đậm trên tổng số điểm không phải nền giấy.
+    """Share of dark pixels among all pixels that are not paper background.
 
-    Đọc lại vùng ảnh đúng như mắt người nhìn thấy trên trang: ảnh có phần trong
-    suốt được chồng lên nền trắng trước khi đo, nên hoa văn chìm hiện ra đúng là
-    một mảng xám nhạt chứ không phải màu gốc đậm của file ảnh.
+    The image area is re-read exactly as the eye sees it on the page: a partly
+    transparent image is composited over white before being measured, so a
+    watermark shows up as the pale grey wash it really is, not as the strong
+    original colour stored in the image file.
     """
     rect = fitz.Rect(bbox) & page.rect
     if rect.is_empty:
-        return 1.0                    # không đo được thì coi là hình thật
+        return 1.0                    # if it cannot be measured, treat it as a real figure
     try:
         pix = page.get_pixmap(clip=rect, dpi=WATERMARK_DPI, colorspace=fitz.csGRAY)
     except (RuntimeError, ValueError):
@@ -130,16 +138,17 @@ def dark_ink_ratio(page: fitz.Page, bbox) -> float:
     hist = Counter(pix.samples)
     nonwhite = sum(count for value, count in hist.items() if value < NEAR_WHITE)
     if not nonwhite:
-        return 0.0                    # trắng tinh: không có gì để giữ
+        return 0.0                    # pure white: nothing worth keeping
     dark = sum(count for value, count in hist.items() if value < WATERMARK_INK)
     return dark / nonwhite
 
 
 def text_over_image(page: fitz.Page, bbox) -> int:
-    """Số ký tự *sống* của trang nằm trong khung ảnh.
+    """How many of the page's *live* characters fall inside the image box.
 
-    Khác 0 nghĩa là ảnh được vẽ dưới chữ — nó là khung, dải màu hay nền, chứ
-    không phải hình: chữ của một hình nội dung nằm trong chính file ảnh.
+    Anything above zero means the image is drawn under the text — it is a frame,
+    a colour band or a background, not a figure: a content figure carries its own
+    text inside the image file.
     """
     rect = fitz.Rect(bbox) & page.rect
     if rect.is_empty:
@@ -151,24 +160,25 @@ def text_over_image(page: fitz.Page, bbox) -> int:
 
 
 def colour_count(page: fitz.Page, bbox) -> int:
-    """Số màu khác nhau khi dựng lại vùng ảnh — ảnh chụp nhiều hơn hẳn nét vẽ."""
+    """Distinct colours in the rendered image area — photographs far exceed line art."""
     rect = fitz.Rect(bbox) & page.rect
     if rect.is_empty:
         return 0
     try:
         return page.get_pixmap(clip=rect, dpi=PHOTO_DPI).color_count()
     except (AttributeError, RuntimeError, ValueError):
-        return 0                      # không đo được thì đừng gỡ nhầm
+        return 0                      # unmeasurable: do not risk dropping it
 
 
 def collect_pdf_images(doc: fitz.Document,
                        treat_first_page_as_cover: bool = False) -> dict[int, list[DocImage]]:
-    """Duyệt toàn tài liệu, xếp loại từng ảnh rồi gom theo trang.
+    """Walk the whole document, classify every image and group them by page.
 
-    `treat_first_page_as_cover`: ảnh lớn ở trang đầu gần như luôn là hình bìa
-    trang trí, không phải nội dung. Bật khi xuất bản sạch để gỡ chúng đi.
+    `treat_first_page_as_cover`: a large image on the first page is almost
+    always decorative cover art rather than content. Turn it on when writing the
+    cleaned document, so those get dropped.
     """
-    # Đếm số trang mà mỗi ảnh xuất hiện: lặp nhiều = logo/nền
+    # Count the pages each image appears on: many pages = logo/background
     pages_per_xref: dict[int, set[int]] = {}
     raw: list[tuple[int, dict]] = []
     for pno, page in enumerate(doc, start=1):
@@ -193,25 +203,26 @@ def collect_pdf_images(doc: fitz.Document,
         repeats = len(pages_per_xref.get(xref, {pno}))
         in_margin = y0 < page.rect.height * MARGIN_TOP or y1 > page.rect.height * MARGIN_BOTTOM
 
-        # Ảnh phủ gần kín trang mà trang vẫn có nhiều chữ thì đó là nền trang trí:
-        # nội dung thật nằm ở phần text, giữ ảnh lại chỉ thêm nhiễu.
+        # An image covering nearly the whole page while the page still holds
+        # plenty of text is a decorative background: the real content is the
+        # text, and keeping the image only adds noise.
         covers_page = area_ratio >= 0.85
         text_len = len(page.get_text("text").strip())
 
         caption = ""
         if covers_page and text_len >= 200:
-            kind, reason = "logo", "ảnh nền phủ kín trang"
+            kind, reason = "logo", "background image covering the page"
         elif treat_first_page_as_cover and pno == 1 and area_ratio >= MIN_FIGURE_AREA_RATIO:
-            kind, reason = "cover", "hình bìa"
+            kind, reason = "cover", "cover image"
         elif repeats >= REPEAT_PAGES:
-            kind, reason = "logo", f"lặp trên {repeats} trang"
+            kind, reason = "logo", f"repeated on {repeats} pages"
         elif min(w, h) < MIN_FIGURE_SIDE or area_ratio < MIN_FIGURE_AREA_RATIO:
-            kind, reason = "logo", f"quá nhỏ ({round(w)}x{round(h)})"
+            kind, reason = "logo", f"too small ({round(w)}x{round(h)})"
         elif in_margin and area_ratio < 0.12:
-            kind, reason = "logo", "nằm ở lề trang"
+            kind, reason = "logo", "sits in the page margin"
         else:
-            # Chú thích "Hình 3: …" là lời người soạn tự nhận đây là hình nội
-            # dung — tin lời đó, khỏi đo đạc gì nữa.
+            # A caption ("Hình 3: …") is the author declaring this a content
+            # figure — take their word for it and skip the measurements.
             caption = _find_caption(page, (x0, y0, x1, y1))
             chars = 0 if caption else text_over_image(page, (x0, y0, x1, y1))
             ink = 1.0 if caption else dark_ink_ratio(page, (x0, y0, x1, y1))
@@ -219,13 +230,13 @@ def collect_pdf_images(doc: fitz.Document,
             if not caption and text_len >= PAGE_TEXT_FOR_PHOTO_TEST:
                 colours = colour_count(page, (x0, y0, x1, y1))
             if ink < WATERMARK_INK_RATIO:
-                kind, reason = "logo", f"hoa văn chìm, không có nét đậm ({ink:.0%})"
+                kind, reason = "logo", f"watermark, no dark ink ({ink:.0%})"
             elif chars >= TEXT_OVER_IMAGE_CHARS:
-                kind, reason = "logo", f"khung trang trí, chữ của trang đè lên ({chars} ký tự)"
+                kind, reason = "logo", f"decorative frame, page text on top ({chars} chars)"
             elif colours >= PHOTO_COLOURS:
-                kind, reason = "logo", f"ảnh chụp trang trí ({colours} màu)"
+                kind, reason = "logo", f"decorative photograph ({colours} colours)"
             else:
-                kind, reason = "figure", f"ảnh nội dung ({round(w)}x{round(h)})"
+                kind, reason = "figure", f"content image ({round(w)}x{round(h)})"
 
         img = DocImage(
             page=pno, bbox=(x0, y0, x1, y1), width=w, height=h,
@@ -236,28 +247,30 @@ def collect_pdf_images(doc: fitz.Document,
     return out
 
 
-# --- sơ đồ vẽ bằng nét ----------------------------------------------------
+# --- vector diagrams ------------------------------------------------------
 #
-# Lưu đồ quy trình trong văn bản ngân hàng không phải ảnh: nó là một mớ nét vẽ
-# cộng với chữ nằm trong từng ô. Trích xuất theo lối thường sẽ moi hết chữ ra
-# rồi xếp thành một dòng dài vô nghĩa ("Nội dung Mẫu ĐVKD lưu Tiếp nhận và khai
-# báo Kiểm tra, đối chiếu…") — cả sơ đồ biến mất, chỉ còn lại chữ rời rạc.
+# A process flowchart in a banking document is not an image: it is a mass of
+# vector strokes plus the text inside each box. Ordinary extraction pulls all
+# that text out and lays it in one meaningless line ("Nội dung Mẫu ĐVKD lưu Tiếp
+# nhận và khai báo Kiểm tra, đối chiếu…") — the diagram disappears and only
+# scattered words remain.
 #
-# Bảng cũng vẽ bằng nét, nên phải phân biệt cho được. Khác nhau ở chỗ: đường kẻ
-# bảng bao giờ cũng ngang hoặc dọc, còn lưu đồ thì có **nét chéo** (mũi tên,
-# cạnh hình thoi) và **nét cong** (hình bầu dục, góc bo). Đo trên tài liệu thật,
-# trang bảng có đúng 0 nét như vậy còn trang lưu đồ có vài chục.
+# Tables are drawn with strokes too, so the two have to be told apart. The
+# difference: table rules are always horizontal or vertical, while a flowchart
+# has **diagonal strokes** (arrows, the sides of a diamond) and **curves**
+# (ellipses, rounded corners). Measured on real documents, a table page has
+# exactly 0 such strokes and a flowchart page has dozens.
 MIN_DIAGRAM_MARKS = 6
-# Hai nét cách nhau trong khoảng này thì thuộc cùng một hình
+# Two strokes closer than this belong to the same figure
 DIAGRAM_GAP = 26.0
-# Nới rìa vùng hình để không cắt cụt nét ngoài cùng khi xuất ảnh
+# Pad the figure box so the outermost stroke is not clipped on export
 DIAGRAM_PAD = 6.0
 MIN_DIAGRAM_AREA_RATIO = 0.05
 MIN_DIAGRAM_SIDE = 90
 
 
 def _stroke_boxes(page: fitz.Page) -> tuple[list[fitz.Rect], list[fitz.Rect]]:
-    """Khung bao của từng nét vẽ, tách riêng các nét *không* ngang dọc."""
+    """Bounding boxes of every stroke, with the *non*-orthogonal ones kept apart."""
     boxes: list[fitz.Rect] = []
     marks: list[fitz.Rect] = []
     for drawing in page.get_drawings():
@@ -278,7 +291,7 @@ def _stroke_boxes(page: fitz.Page) -> tuple[list[fitz.Rect], list[fitz.Rect]]:
 
 
 def _clusters(boxes: list[fitz.Rect], gap: float) -> list[fitz.Rect]:
-    """Gom các khung nằm gần nhau thành từng vùng liền khối."""
+    """Merge nearby boxes into contiguous regions."""
     out: list[fitz.Rect] = []
     for box in boxes:
         grown = box + (-gap, -gap, gap, gap)
@@ -287,7 +300,7 @@ def _clusters(boxes: list[fitz.Rect], gap: float) -> list[fitz.Rect]:
             out.remove(r)
             box = box | r
         out.append(box)
-    # một vòng nữa cho các vùng chỉ dính nhau sau khi đã gộp
+    # one more pass for regions that only touch after the first merge
     if len(out) > 1:
         merged: list[fitz.Rect] = []
         for box in out:
@@ -302,7 +315,7 @@ def _clusters(boxes: list[fitz.Rect], gap: float) -> list[fitz.Rect]:
 
 
 def collect_vector_figures(page: fitz.Page) -> list[DocImage]:
-    """Các sơ đồ vẽ bằng nét trên một trang, kèm khung bao của từng cái."""
+    """The vector diagrams on a page, each with its bounding box."""
     boxes, marks = _stroke_boxes(page)
     if len(marks) < MIN_DIAGRAM_MARKS:
         return []
@@ -322,7 +335,7 @@ def collect_vector_figures(page: fitz.Page) -> list[DocImage]:
         img = DocImage(
             page=page.number + 1, bbox=tuple(rect),
             width=rect.width, height=rect.height,
-            kind="figure", reason=f"sơ đồ vẽ bằng nét ({inside} nét chéo/cong)",
+            kind="figure", reason=f"vector diagram ({inside} diagonal/curved strokes)",
             meta={"vector": True},
         )
         img.caption = _find_caption(page, img.bbox)
@@ -332,12 +345,13 @@ def collect_vector_figures(page: fitz.Page) -> list[DocImage]:
 
 def export_figures(doc: fitz.Document, images: dict[int, list[DocImage]],
                    out_dir: str, doc_id: str) -> int:
-    """Tách các hình nội dung ra file PNG để dùng lại (vd. cho mô hình ảnh)."""
+    """Export content figures as PNG files for reuse (e.g. by a vision model)."""
     saved = 0
     os.makedirs(out_dir, exist_ok=True)
 
-    # Dọn ảnh cũ của đúng tài liệu này. Nếu lần chạy trước tách ra nhiều hình
-    # hơn (do đổi ngưỡng phân loại), các file thừa sẽ nằm lại và gây nhầm lẫn.
+    # Clear this document's previous images. If an earlier run extracted more
+    # figures (because a threshold changed), the leftovers would linger and
+    # confuse whoever reads the folder.
     prefix = f"{doc_id}_p"
     for name in os.listdir(out_dir):
         if name.startswith(prefix) and name.endswith(".png"):

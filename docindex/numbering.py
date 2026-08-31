@@ -1,9 +1,10 @@
-"""Render chỉ mục tự động của Word (numbering.xml).
+"""Render Word's automatic numbering (numbering.xml).
 
-Đây là mấu chốt: khi Word đánh số tự động, các số "1.", "2.1.", "a)" KHÔNG nằm
-trong text của paragraph mà được Word sinh ra lúc hiển thị. Đọc file bằng
-python-docx thuần sẽ mất sạch chỉ mục -> RAG không còn tín hiệu phân cấp.
-Module này dựng lại đúng chuỗi số đó theo quy tắc OOXML.
+This is the crux of DOCX extraction: when Word numbers a list automatically,
+the "1.", "2.1.", "a)" markers are NOT in the paragraph text — Word generates
+them at display time. Reading the file with plain python-docx loses every
+section number, and the RAG stack is left with no hierarchy signal at all.
+This module rebuilds those strings following the OOXML rules.
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ def _to_roman(n: int) -> str:
 
 
 def _to_letter(n: int) -> str:
-    """1 -> a, 26 -> z, 27 -> aa (kiểu bảng chữ cái Word)."""
+    """1 -> a, 26 -> z, 27 -> aa (Word's alphabetic numbering)."""
     if n <= 0:
         return str(n)
     out = ""
@@ -54,7 +55,7 @@ def _format_counter(value: int, fmt: str) -> str:
     return str(value)
 
 
-# Các định dạng được coi là "có đánh số" (khác bullet/none)
+# The formats that count as "numbered" (as opposed to bullet/none)
 NUMERIC_FORMATS = {
     "decimal", "decimalZero", "lowerLetter", "upperLetter",
     "lowerRoman", "upperRoman",
@@ -83,17 +84,17 @@ def _val(parent, tag: str, default=None):
 
 
 class NumberingResolver:
-    """Duyệt tài liệu theo thứ tự và trả về chỉ mục cho từng paragraph.
+    """Walks the document in order and hands back a number for each paragraph.
 
-    Phải gọi `number_for()` theo đúng thứ tự xuất hiện trong tài liệu vì
-    bộ đếm là trạng thái tích luỹ (giống cách Word render).
+    `number_for()` must be called in the order the paragraphs appear, because
+    the counters are accumulated state (exactly how Word renders them).
     """
 
     def __init__(self, document):
         self._levels: dict[str, dict[int, _Level]] = {}   # abstractNumId -> {ilvl: _Level}
         self._num_to_abstract: dict[str, str] = {}
         self._overrides: dict[str, dict[int, int]] = {}   # numId -> {ilvl: startOverride}
-        self._counters: dict[str, dict[int, int]] = {}    # abstractNumId -> {ilvl: giá trị hiện tại}
+        self._counters: dict[str, dict[int, int]] = {}    # abstractNumId -> {ilvl: current value}
         self._seen_num: set[str] = set()
         self._load(document)
 
@@ -101,7 +102,7 @@ class NumberingResolver:
         try:
             part = document.part.numbering_part
         except (KeyError, AttributeError, ValueError):
-            return  # tài liệu không có numbering
+            return  # the document carries no numbering part
         root = part.element
 
         for an in root.findall(qn("w:abstractNum")):
@@ -111,10 +112,10 @@ class NumberingResolver:
                 lvl = _Level(lvl_el)
                 lv[lvl.ilvl] = lvl
             self._levels[aid] = lv
-            # abstractNum có thể trỏ tới abstractNum khác qua numStyleLink
+            # an abstractNum may point at another one through numStyleLink
             link = _val(an, "w:numStyleLink", None)
             if link:
-                self._levels[aid] = lv  # giữ nguyên, sẽ resolve ở dưới nếu rỗng
+                self._levels[aid] = lv  # keep as-is; resolved below when empty
 
         for num in root.findall(qn("w:num")):
             nid = num.get(qn("w:numId"))
@@ -141,9 +142,9 @@ class NumberingResolver:
         return self._levels.get(aid, {}).get(ilvl)
 
     def number_for(self, num_id: str | int | None, ilvl: int | None) -> tuple[str | None, str]:
-        """Tăng bộ đếm và trả về (chuỗi chỉ mục, định dạng).
+        """Advance the counters and return (number string, format).
 
-        Trả về (None, fmt) nếu là bullet hoặc không đánh số.
+        Returns (None, fmt) for bullets and unnumbered paragraphs.
         """
         if num_id is None:
             return None, "none"
@@ -159,14 +160,14 @@ class NumberingResolver:
 
         counters = self._counters.setdefault(aid, {})
 
-        # Áp startOverride lần đầu numId này xuất hiện
+        # Apply startOverride the first time this numId shows up
         if num_id not in self._seen_num:
             self._seen_num.add(num_id)
             for il, start in self._overrides.get(num_id, {}).items():
                 counters[il] = start - 1
 
         if lvl.fmt in ("bullet", "none"):
-            # bullet vẫn phải reset cấp con để chỉ mục cấp dưới không bị trôi
+            # bullets still reset deeper levels, or the numbers below drift
             self._reset_deeper(counters, levels, ilvl)
             return None, lvl.fmt
 
@@ -178,7 +179,7 @@ class NumberingResolver:
 
     @staticmethod
     def _reset_deeper(counters: dict[int, int], levels: dict[int, _Level], ilvl: int) -> None:
-        """Cấp con quay về mốc ban đầu khi cấp cha tăng (trừ khi lvlRestart=0)."""
+        """Deeper levels restart when a parent level advances (unless lvlRestart=0)."""
         for il in list(counters):
             if il > ilvl:
                 deeper = levels.get(il)
@@ -188,7 +189,7 @@ class NumberingResolver:
 
     @staticmethod
     def _render(lvl: _Level, counters: dict[int, int], levels: dict[int, _Level]) -> str:
-        """Thay %1..%9 trong lvlText bằng giá trị bộ đếm tương ứng."""
+        """Substitute %1..%9 in lvlText with the matching counter values."""
         text = lvl.text or ""
         if not text:
             return ""
@@ -200,7 +201,7 @@ class NumberingResolver:
             idx = i - 1
             ldef = levels.get(idx)
             if counters.get(idx) is None:
-                # cấp cha chưa từng chạy -> dùng giá trị start để không sinh số rỗng
+                # parent level never ran -> use its start value so no empty number appears
                 value = ldef.start if ldef is not None else 1
             else:
                 value = counters[idx]

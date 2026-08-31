@@ -1,8 +1,12 @@
-"""Nhận diện tiêu đề và dựng cây mục lục.
+"""Detect headings and build the outline tree.
 
-Nguyên tắc: một chunk chỉ nên chứa một chủ đề. Chủ đề ở đây được xác định bằng
-mục lục của tài liệu, nên chất lượng chunk phụ thuộc trực tiếp vào việc nhận
-diện tiêu đề có đúng hay không.
+The governing principle: a chunk should hold exactly one topic. Topics are
+defined here by the document's own outline, so chunk quality depends directly
+on whether headings are detected correctly.
+
+The heading patterns below are written for Vietnamese administrative and legal
+documents, which is what this tool processes; the keywords in them are part of
+the input format, not user-facing text.
 """
 from __future__ import annotations
 
@@ -10,106 +14,109 @@ import re
 
 from .models import PREAMBLE_TITLE, Block, Section, clean_text, continues_sentence
 
-# Thứ bậc các loại tiêu đề trong văn bản hành chính/pháp lý Việt Nam.
-# Số nhỏ = cấp cao hơn.
+# Rank of each heading kind in Vietnamese administrative and legal documents.
+# Lower number = higher level.
 #
-# Các mốc cách nhau rộng vì cấp của danh sách Word được cộng thêm vào mốc:
-# hai loại ký hiệu khác nhau không bao giờ được rơi trúng cùng một số, nếu
-# không hai cấp khác nhau sẽ bị nén thành một khi dựng cây.
-RANK_BANNER = -1       # TỔNG QUAN VĂN BẢN QUY ĐỊNH — tiêu đề lớn không đánh số
+# The marks are spaced widely because a Word list level is added on top of the
+# mark: two different marker kinds must never land on the same number, or two
+# distinct levels collapse into one when the tree is built.
+RANK_BANNER = -1       # an unnumbered banner heading, e.g. "TỔNG QUAN…"
 RANK_PART = 0          # PHẦN 1, Phần I
 RANK_CHAPTER = 1       # CHƯƠNG I
 RANK_APPENDIX = 1      # Phụ lục 01
 RANK_SECTION = 2       # MỤC 1
-RANK_ROMAN_UPPER = 3   # I.  II.  III.  — cấp lớn trong văn bản hành chính
+RANK_ROMAN_UPPER = 3   # I.  II.  III.  — a high level in administrative texts
 RANK_ARTICLE = 4       # ĐIỀU 5
 RANK_DECIMAL = 10      # 1.  /  2.1.  /  2.3.1.
 RANK_LETTER_UPPER = 25 # A)  B)
 RANK_LETTER = 30       # a)  b)
 RANK_ROMAN = 50        # (i) (ii)
 
-# Chữ số La Mã hợp lệ: I..XXXIX. Dùng để tách "I." (cấp lớn) khỏi "i)" (mục
-# thứ 9 của một danh sách chữ cái a) b) ... i) — hai thứ hoàn toàn khác nhau).
+# Valid Roman numerals: I..XXXIX. Used to tell "I." (a high level) from "i)"
+# (the ninth item of an a) b) … i) letter list — an entirely different thing).
 _IS_ROMAN = re.compile(r"^(?=[ivx])x{0,3}(ix|iv|v?i{0,3})$", re.I)
 
 _PATTERNS: list[tuple[re.Pattern, int, str]] = [
     (re.compile(r"^(PHẦN|Phần)\s+([0-9IVXivx]+)\s*[:.\-–]?\s*(.*)$"), RANK_PART, "part"),
     (re.compile(r"^(CHƯƠNG|Chương)\s+([0-9IVXivx]+)\s*[:.\-–]?\s*(.*)$"), RANK_CHAPTER, "chapter"),
     (re.compile(r"^(PHỤ LỤC|Phụ lục)\s*([0-9IVXivx]*)\s*[:.\-–]?\s*(.*)$"), RANK_APPENDIX, "appendix"),
-    # Mã hiệu phụ lục nội bộ, vd "PL02.1003.PCS.2026(1): Giải thích từ ngữ".
-    # Dấu ngăn không nhận dấu chấm: chấm là một phần của chính mã hiệu, nhận nó
-    # thì câu dẫn chiếu "…theo Phụ lục số PL01.1016.PDS.2026(1);" cũng khớp và
-    # đẻ ra một nhánh cấp cao nuốt hết các mục đứng sau.
+    # An internal appendix code, e.g. "PL02.1003.PCS.2026(1): Giải thích từ ngữ".
+    # The separator does not accept a dot: the dot is part of the code itself, and
+    # accepting it makes a cross-reference like "…theo Phụ lục số
+    # PL01.1016.PDS.2026(1);" match too, spawning a high-level branch that
+    # swallows every section after it.
     (re.compile(r"^(PL)\s*([0-9][0-9.()A-Za-z]*)\s*[:\-–]\s*(.*)$"), RANK_APPENDIX, "appendix"),
     (re.compile(r"^(MỤC|Mục)\s+([0-9IVXivx]+)\s*[:.\-–]?\s*(.*)$"), RANK_SECTION, "section"),
     (re.compile(r"^(ĐIỀU|Điều)\s+(\d+)\s*[:.\-–]?\s*(.*)$"), RANK_ARTICLE, "article"),
 ]
 
-# "1." "2.1." "2.3.1." — dấu chấm cuối có thể có hoặc không
+# "1." "2.1." "2.3.1." — the trailing dot is optional
 _DECIMAL = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+(\S.*)$")
-# Tiêu đề chỉ có số, nội dung nằm ở dòng dưới
+# A heading that is only a number, with the name on the line below
 _DECIMAL_ONLY = re.compile(r"^(\d+(?:\.\d+)*)\.?$")
-# Giữ nguyên dấu sau ký hiệu ("c." chứ không phải "c") để tiêu đề đọc đúng như
-# trong văn bản gốc.
+# Keep the punctuation after the marker ("c." rather than "c") so the heading
+# reads exactly as it does in the source document.
 _LETTER = re.compile(r"^([a-zA-Z][.)])\s+(\S.*)$")
 _ROMAN = re.compile(r"^(\(?[ivxIVX]{1,5}[.)])\s+(\S.*)$")
 
-# Câu mở đầu bằng cách dẫn chiếu điều khoản, dễ bị nhầm là tiêu đề
+# A sentence opening with a clause cross-reference, easily mistaken for a heading
 _REFERENCE = re.compile(
     r"^(theo|tại|quy định tại|căn cứ|xem|nêu tại|như)\b", re.I
 )
 
-# Tiêu đề lớn không đánh số ("TỔNG QUAN VĂN BẢN QUY ĐỊNH", "QUY ĐỊNH SẢN PHẨM
-# TIẾT KIỆM LINH HOẠT"): dài tối đa ngần này ký tự và viết hoa gần như toàn bộ.
+# An unnumbered banner heading ("TỔNG QUAN VĂN BẢN QUY ĐỊNH", "QUY ĐỊNH SẢN
+# PHẨM TIẾT KIỆM LINH HOẠT"): at most this many characters, and almost entirely
+# uppercase.
 MAX_BANNER_LEN = 120
 BANNER_UPPER_RATIO = 0.8
-# Tài liệu chỉ có đúng một tiêu đề lớn thì đó chính là tên tài liệu — vốn đã
-# được đặt làm gốc của cây. Thêm một nhánh nữa cho nó là mọc thêm một cấp thừa,
-# mà cây chỉ sâu được 3 cấp. Từ hai cái trở lên thì chúng mới thật sự chia tài
-# liệu thành các phần lớn và phải trở thành cấp cao nhất.
+# A document with exactly one banner heading has that heading as its title —
+# which is already the root of the tree. Giving it another branch grows one
+# redundant level, and the tree only goes 3 deep. From two banners up they
+# genuinely divide the document into major parts and must become the top level.
 MIN_BANNERS = 2
 
-# Cây chỉ mục chỉ sâu tối đa 3 cấp. Từ cấp 4 ("1.1.1.1") trở xuống, đề mục
-# không còn là một nhánh nữa mà chỉ là nội dung của mục cha: chia nhỏ tới đó
-# thì mỗi nút chỉ còn một hai câu, vector của nó gần như không mang thông tin,
-# mà title của chunk lại dài thêm một cấp vô ích.
+# The outline goes at most 3 levels deep. From level 4 ("1.1.1.1") down, a
+# heading stops being a branch and becomes ordinary content of its parent:
+# splitting that far leaves each node holding one or two sentences, its vector
+# carries almost no information, and the chunk title grows a pointless level.
 MAX_TREE_LEVEL = 3
 
 MAX_HEADING_LEN = 250
-# Độ dài tối đa của tiêu đề khi đưa vào đường dẫn mục lục
+# Maximum heading length when it goes into the outline path
 MAX_TITLE_IN_PATH = 90
-# Độ dài tối đa của tiêu đề khi *in ra giấy*. Rộng hơn hẳn trần của đường dẫn:
-# tiền tố mục lục phải nhường chỗ cho nội dung nên buộc phải cắt bớt, nhưng
-# dòng tiêu đề trên trang thì không có ràng buộc đó — cắt nó ở mốc 90 ký tự là
-# đứt ngang giữa một cụm từ ("…làm nguyên" / "liệu sản xuất") và mô hình DLA
-# đọc ra một tên mục thiếu chữ.
+# Maximum heading length when it is *printed on the page*. Far wider than the
+# path ceiling: the outline prefix has to yield room to the content and must be
+# trimmed, but the heading line on the page has no such constraint — cutting it
+# at 90 characters breaks mid-phrase ("…làm nguyên" / "liệu sản xuất") and a DLA
+# model reads a section name with words missing.
 MAX_TITLE_IN_HEADING = 200
-# Tên mục (phần trước dấu hai chấm) dài hơn ngần này thì không còn là tên nữa
+# A section name (the part before the colon) longer than this is no longer a name
 MAX_NAME_IN_HEADING = 60
-# Đề mục không có dấu hai chấm: cả dòng là tên mục, dài hơn ngần này mới coi là
-# câu văn mở đầu bằng một con số chứ không phải đề mục
+# A heading with no colon: the whole line is the name. Only lines longer than
+# this are treated as prose that happens to open with a number
 MAX_PLAIN_HEADING_LEN = 160
-# Dấu hai chấm ngăn tên mục với nội dung — không tính dấu giữa hai chữ số
+# The colon separating a section name from its content — not one between digits
 _NAME_COLON = re.compile(r"(?<!\d):(?!\d)")
 
-# Hàng bảng đã làm phẳng thành một dòng: "STT: 3.1 | Nội dung: Đối tượng khách
-# hàng | Cụ thể: …". Dấu sổ đứng ngăn các cột với nhau.
+# A table row flattened into one line: "STT: 3.1 | Nội dung: Đối tượng khách
+# hàng | Cụ thể: …". The pipe separates the columns.
 _FLAT_FIELD = re.compile(r"\s*\|\s*")
-# Ô chỉ chứa số thứ tự ("3.1", "02", "-") thì không phải tên mục
+# A cell holding only an index ("3.1", "02", "-") is not a section name
 _INDEX_VALUE = re.compile(r"^[\d.,/()\-–\s]*$")
 
 
 def _flat_row_name(title: str, limit: int) -> str | None:
-    """Tên mục của một hàng bảng đã làm phẳng, hoặc None nếu không phải hàng bảng.
+    """The section name of a flattened table row, or None if it is not one.
 
-    Bảng được làm phẳng trước khi đưa vào tool thì mỗi hàng thành một dòng, và
-    dòng ấy luôn mở đầu bằng cột số thứ tự ("STT: 3.1"). Cắt tại dấu hai chấm
-    đầu tiên như tiêu đề thường sẽ lấy đúng *tên cột* làm tên mục — cả cây chỉ
-    mục biến thành một dãy "STT" giống hệt nhau, không còn phân biệt được mục
-    nào với mục nào.
+    When a table is flattened before the file reaches the tool, every row
+    becomes one line, and that line always opens with the index column
+    ("STT: 3.1"). Cutting at the first colon, as for an ordinary heading, takes
+    the *column name* as the section name — turning the whole outline into a run
+    of identical "STT" entries with nothing to tell one section from another.
 
-    Tên mục thật là giá trị đầu tiên mang nghĩa: bỏ qua cột chỉ chứa số thứ tự
-    và cột bỏ trống, rồi ưu tiên giá trị đủ ngắn để làm tên.
+    The real name is the first value that carries meaning: skip columns holding
+    only an index and columns left blank, then prefer a value short enough to
+    serve as a name.
     """
     fields = _FLAT_FIELD.split(title)
     if len(fields) < 2:
@@ -118,8 +125,8 @@ def _flat_row_name(title: str, limit: int) -> str | None:
     values = []
     for field in fields:
         label, sep, value = field.partition(":")
-        # Bước làm phẳng có lúc rơi mất nhãn của một cột ("Khoản: 3.1 | Điều
-        # kiện vay vốn | Quy định:"): cả ô khi ấy chính là giá trị.
+        # The flattening step sometimes loses a column's label ("Khoản: 3.1 |
+        # Điều kiện vay vốn | Quy định:"): the whole cell is then the value.
         if not sep:
             value = label
         labelled = labelled or bool(sep)
@@ -128,38 +135,40 @@ def _flat_row_name(title: str, limit: int) -> str | None:
             values.append(value)
     if not labelled:
         return None
-    # Hàng nối tiếp của một ô trải dài: mọi cột đều trống, hàng này không có
-    # tên. Trả về tên rỗng để mục hiện ra bằng đúng số của nó — lấy đại tên cột
-    # làm tên mục thì cây chỉ mục có một dãy "STT" không phân biệt được.
+    # A continuation row of a cell spanning several rows: every column is blank
+    # and this row has no name. Return an empty name so the section shows as its
+    # number alone — grabbing a column label instead fills the outline with an
+    # indistinguishable run of "STT" entries.
     if not values:
         return ""
-    # Cột nội dung dài là thân bài, không phải tên; chỉ dùng khi không còn gì khác
+    # A long content column is body text, not a name; used only as a last resort
     return next((v for v in values if len(v) <= limit), values[0])
 
 
 def shorten_title(title: str, limit: int = MAX_TITLE_IN_PATH) -> str:
-    """Rút tiêu đề về phần mang nghĩa nhất — chính là *tên* của mục.
+    """Reduce a heading to its most meaningful part — the section's *name*.
 
-    Nhiều mục trong văn bản hành chính viết liền cả nội dung vào dòng tiêu đề
-    ("Hợp đồng bảo hiểm: là tất cả văn bản thể hiện sự thỏa thuận giữa Bên mua
-    bảo hiểm và Dai-ichi Life Việt Nam…"). Tên mục là phần trước dấu hai chấm;
-    phần sau là nội dung và sẽ được đưa xuống thân bài.
+    Many sections in administrative documents run the content straight into the
+    heading line ("Hợp đồng bảo hiểm: là tất cả văn bản thể hiện sự thỏa thuận
+    giữa Bên mua bảo hiểm và Dai-ichi Life Việt Nam…"). The name is the part
+    before the colon; what follows is content and moves down into the body.
 
-    Luật cắt tại dấu hai chấm phải chạy với *mọi* độ dài, không chỉ khi tiêu đề
-    vượt trần: một câu dài 80 ký tự vẫn là câu, đặt nguyên nó làm tên mục thì
-    cây chỉ mục đọc như văn xuôi và title của chunk sai hẳn.
+    The cut-at-the-colon rule has to run at *every* length, not only when the
+    heading exceeds the ceiling: an 80-character sentence is still a sentence,
+    and using it whole as a section name makes the outline read like prose and
+    the chunk titles plainly wrong.
     """
     title = title.strip()
     flat = _flat_row_name(title, limit)
     if flat is not None:
         title = flat
-    # Bỏ qua dấu hai chấm nằm giữa hai chữ số ("8:30", "1:2") — đó là giờ giấc
-    # hay tỉ lệ, không phải ranh giới giữa tên mục và nội dung.
+    # Skip a colon between two digits ("8:30", "1:2") — that is a time or a
+    # ratio, not the boundary between name and content.
     mark = _NAME_COLON.search(title)
     if mark:
         head = title[:mark.start()].strip()
-        # tên mục dài quá trần thì dấu hai chấm đó nằm giữa một câu, không phải
-        # ranh giới tên
+        # if the name exceeds the ceiling, that colon sits mid-sentence and is
+        # not a name boundary
         if head and len(head) <= limit:
             return head
     if len(title) <= limit:
@@ -174,13 +183,13 @@ def shorten_title(title: str, limit: int = MAX_TITLE_IN_PATH) -> str:
 
 
 def _match_heading(text: str) -> tuple[str, str, int, str] | None:
-    """Trả về (số mục, tiêu đề, rank, loại) nếu text trông như một tiêu đề."""
+    """Return (number, title, rank, kind) if the text looks like a heading."""
     for pattern, rank, kind in _PATTERNS:
         m = pattern.match(text)
         if m:
             prefix, number = m.group(1), m.group(2)
-            # Mã hiệu nội bộ viết liền ("PL02.1003.PCS"), tách ra thành "PL 02"
-            # sẽ khiến tra cứu theo mã không khớp nữa.
+            # An internal code is written solid ("PL02.1003.PCS"); splitting it
+            # into "PL 02" would break lookups by code.
             if prefix.upper() == "PL":
                 num = f"{prefix}{number}".strip()
             else:
@@ -215,12 +224,12 @@ def _match_heading(text: str) -> tuple[str, str, int, str] | None:
 
 
 def _roman_rank(marker: str) -> tuple[int, str]:
-    """Cấp của một ký hiệu La Mã — không phải cái nào cũng là cấp sâu.
+    """The level of a Roman marker — not all of them are deep levels.
 
-    "I." "II." trong văn bản hành chính Việt Nam là cấp lớn, đứng trên cả "1.".
-    Còn "(i)" "(ii)" là cấp sâu nhất. Riêng "i)" trơ trọi thường chỉ là mục thứ
-    9 của danh sách a) b) c)… — xếp nó thành một cấp riêng sẽ đẻ ra một tầng
-    giả ngay giữa danh sách.
+    In Vietnamese administrative documents "I." and "II." are a high level,
+    above even "1.", while "(i)" and "(ii)" are the deepest. A bare "i)", by
+    contrast, is usually just the ninth item of an a) b) c)… list — giving it a
+    level of its own spawns a phantom tier in the middle of that list.
     """
     token = marker.strip("().")
     if token.isupper() and _IS_ROMAN.match(token):
@@ -231,13 +240,13 @@ def _roman_rank(marker: str) -> tuple[int, str]:
 
 
 def _word_rank(marker: str, list_format: str, word_level: int) -> int:
-    """Cấp của một chỉ mục do Word sinh ra.
+    """The level of a number Word generated.
 
-    Cấp danh sách của Word (`ilvl`) không đáng tin: tài liệu thật hay khai
-    danh sách "a) b) c)" ở cùng ilvl với "1. 2. 3.", và khi đó cây mục lục bị
-    phẳng ra — mục con thành mục ngang hàng với mục cha. Loại ký hiệu
-    (`numFmt`) mới là thứ nói đúng thứ bậc, `ilvl` chỉ dùng để phân cấp *bên
-    trong* cùng một loại ký hiệu.
+    Word's list level (`ilvl`) is not trustworthy: real documents routinely
+    declare an "a) b) c)" list at the same ilvl as "1. 2. 3.", and the outline
+    then flattens — a child section becomes a sibling of its parent. It is the
+    marker kind (`numFmt`) that states the true hierarchy; `ilvl` is used only to
+    rank levels *within* one marker kind.
     """
     fmt = (list_format or "").lower()
     offset = max(0, (word_level or 1) - 1)
@@ -245,21 +254,21 @@ def _word_rank(marker: str, list_format: str, word_level: int) -> int:
         return (RANK_ROMAN_UPPER if "upper" in fmt else RANK_ROMAN) + offset
     if "letter" in fmt:
         return (RANK_LETTER_UPPER if "upper" in fmt else RANK_LETTER) + offset
-    # Chỉ mục nhiều cấp ("2.1") đã tự nói lên độ sâu của nó
+    # A multi-level number ("2.1") already states its own depth
     dots = marker.strip().rstrip(".").count(".")
     return RANK_DECIMAL + max(dots, offset)
 
 
 def _looks_like_heading(block: Block, text: str, title: str, kind: str,
                         from_word_numbering: bool) -> bool:
-    """Lọc bớt trường hợp câu văn thường bị bắt nhầm thành tiêu đề."""
+    """Filter out ordinary sentences that get mistaken for headings."""
     if _REFERENCE.match(text):
         return False
 
-    # "PHẦN 1", "ĐIỀU 5" rất hay xuất hiện giữa câu dẫn chiếu
-    # ("...quy định tại Điều 2.3 Phần 1 này"). Khi trích xuất PDF cắt dòng,
-    # mảnh câu đó trông y hệt một tiêu đề và nếu nhận nhầm sẽ nuốt toàn bộ
-    # các mục phía sau. Tiêu đề thật luôn có phần tên viết hoa đi kèm.
+    # "PHẦN 1" and "ĐIỀU 5" appear constantly inside cross-references
+    # ("...quy định tại Điều 2.3 Phần 1 này"). Once PDF extraction wraps the
+    # line, that fragment looks exactly like a heading, and mistaking it swallows
+    # every section after it. A real heading always carries a capitalised name.
     if kind in ("part", "chapter", "article", "section", "roman-upper"):
         if not title:
             return False
@@ -267,8 +276,8 @@ def _looks_like_heading(block: Block, text: str, title: str, kind: str,
         if first and first.islower():
             return False
         if not from_word_numbering:
-            # Tiêu đề thật trong PDF luôn được nhấn mạnh (in đậm hoặc viết hoa).
-            # Câu dẫn chiếu như "Điều 5.4.a, Điều 5.4.b nêu trên" thì không.
+            # A real heading in a PDF is always emphasised (bold or uppercase).
+            # A cross-reference like "Điều 5.4.a, Điều 5.4.b nêu trên" is not.
             letters = [c for c in title if c.isalpha()]
             mostly_upper = bool(letters) and sum(
                 1 for c in letters if c.isupper()) / len(letters) >= 0.8
@@ -276,35 +285,37 @@ def _looks_like_heading(block: Block, text: str, title: str, kind: str,
                 return False
 
     if from_word_numbering:
-        # Word đã khẳng định đây là một mục có đánh số trong cấu trúc tài liệu.
-        # Đây là tín hiệu chắc chắn hơn nhiều so với suy đoán từ hình thức chữ,
-        # nhất là với tài liệu không dùng in đậm cho tiêu đề.
+        # Word has declared this a numbered item in the document structure. That
+        # is a far stronger signal than anything inferred from typography, above
+        # all in documents that do not set their headings in bold.
         return True
 
     if len(text) > MAX_HEADING_LEN:
         return False
 
-    # Không có tín hiệu cấu trúc từ file (thường là PDF): phải dựa vào hình thức.
-    # Ký hiệu chữ cái/La Mã rất phổ biến trong danh sách liệt kê nên chỉ nhận
-    # khi in đậm, tránh băm nhỏ nội dung thành hàng loạt mục vụn.
+    # No structural signal from the file (usually a PDF): typography is all there
+    # is. Letter and Roman markers are extremely common in plain enumerations, so
+    # they are only accepted in bold — otherwise the content is shredded into
+    # hundreds of tiny sections.
     if kind in ("letter", "roman") and not block.bold:
         return False
 
     if kind == "decimal" and not block.bold:
-        # Tiêu đề hay viết liền cả nội dung vào cùng dòng ("1.9 Hợp đồng bảo
-        # hiểm: là tất cả văn bản thể hiện sự thỏa thuận…"). Đo độ dài của
-        # *tên mục* — phần trước dấu hai chấm — chứ đo cả dòng thì mọi tiêu đề
-        # kiểu này đều bị loại, và cả nhánh mục con của nó mất theo.
+        # Headings often run the content into the same line ("1.9 Hợp đồng bảo
+        # hiểm: là tất cả văn bản thể hiện sự thỏa thuận…"). Measure the length of
+        # the *name* — the part before the colon — because measuring the whole
+        # line rejects every heading of this shape, taking its whole subtree with
+        # it.
         mark = _NAME_COLON.search(title)
         if mark:
             if len(title[:mark.start()].strip()) > MAX_NAME_IN_HEADING:
                 return False
         elif len(text) > MAX_PLAIN_HEADING_LEN:
-            # Không có dấu hai chấm thì cả dòng chính là tên mục. Tên mục dài
-            # là chuyện thường trong văn bản pháp lý ("15.4 Đối với Khách hàng
-            # là doanh nghiệp Việt Nam đưa người lao động Việt Nam đi đào tạo,
-            # nâng cao trình độ, kỹ năng nghề ở nước ngoài"); chỉ dòng dài hơn
-            # hẳn mức đó mới là câu văn mở đầu bằng một con số.
+            # With no colon the whole line is the name. Long section names are
+            # routine in legal texts ("15.4 Đối với Khách hàng là doanh nghiệp
+            # Việt Nam đưa người lao động Việt Nam đi đào tạo, nâng cao trình độ,
+            # kỹ năng nghề ở nước ngoài"); only a line well past that length is
+            # prose that happens to open with a number.
             return False
 
     if title and title[:1].islower() and not block.bold and kind == "decimal":
@@ -313,12 +324,13 @@ def _looks_like_heading(block: Block, text: str, title: str, kind: str,
 
 
 def _flat_column_labels(marked: list[tuple]) -> set[str]:
-    """Tên các cột của bảng đã làm phẳng, gom từ những hàng còn đủ nhãn.
+    """Column names of a flattened table, gathered from rows that kept their labels.
 
-    Ô bảng trải qua ngắt trang sinh ra hàng nối tiếp chỉ còn trơ tên cột
-    ("3.1.2 Quy định:"). Nhìn riêng dòng ấy thì "Quy định" trông y hệt một tên
-    mục; chỉ khi đối chiếu với các hàng khác trong cùng tài liệu mới biết đó là
-    tên cột, và mục này thật ra không có tên.
+    A cell crossing a page break produces a continuation row holding nothing but
+    a column label ("3.1.2 Quy định:"). Looked at alone, "Quy định" is
+    indistinguishable from a section name; only comparing it against the other
+    rows in the same document reveals it as a column label, and shows that this
+    section in fact has no name.
     """
     labels: set[str] = set()
     for _block, _num, title, _rank, _kind, _word in marked:
@@ -333,14 +345,14 @@ def _flat_column_labels(marked: list[tuple]) -> set[str]:
 
 
 def _drop_column_label(title: str, labels: set[str]) -> str:
-    """Gỡ tên cột đứng đầu tiêu đề của một hàng nối tiếp bảng làm phẳng.
+    """Strip a leading column label from a flattened table's continuation row.
 
-    Hàng nối tiếp chỉ còn lại đúng một cột ("3.1.9 Quy định: năm/lần ĐVKD thực
-    hiện đánh giá lại hạn mức…"). Tên mục không phải là "Quy định" — đó là tên
-    cột; phần sau nó là nội dung tràn từ hàng trước, và nếu dài quá thì hàng
-    này không có tên nào cả.
+    A continuation row is down to a single column ("3.1.9 Quy định: năm/lần ĐVKD
+    thực hiện đánh giá lại hạn mức…"). The section name is not "Quy định" — that
+    is a column label; what follows it is content spilling over from the previous
+    row, and if it runs long this row has no name at all.
 
-    Chỉ xét dòng còn đúng một cột: hàng đủ cột đã có `_flat_row_name` lo.
+    Only single-column lines are considered: full rows are `_flat_row_name`'s job.
     """
     if len(_FLAT_FIELD.split(title)) > 1:
         return title
@@ -352,38 +364,39 @@ def _drop_column_label(title: str, labels: set[str]) -> str:
 
 
 _NUMBER_SEQ = re.compile(r"^\d+(?:\.\d+)*\.?$")
-# "04 (bốn) Năm hợp đồng đầu tiên" — số viết kèm số 0 đứng đầu là số lượng,
-# không phải chỉ mục. Chỉ mục không bao giờ đệm số 0.
+# "04 (bốn) Năm hợp đồng đầu tiên" — a zero-padded number is a quantity, not a
+# section number. Section numbers are never zero-padded.
 _PADDED = re.compile(r"(^|\.)0\d")
 
 
 def _as_counter(number: str) -> tuple[int, ...] | None:
-    """"2.3.1." -> (2, 3, 1). Trả về None nếu không phải chỉ mục dạng số."""
+    """"2.3.1." -> (2, 3, 1). Returns None if it is not a numeric section number."""
     if not _NUMBER_SEQ.match(number.strip()):
         return None
     return tuple(int(p) for p in number.strip().rstrip(".").split("."))
 
 
 def _continues_sequence(num: tuple[int, ...], prev: tuple[int, ...] | None) -> bool:
-    """Chỉ mục này có nối tiếp được dãy đang mở không?
+    """Does this number continue the sequence currently open?
 
-    Một câu văn bắt đầu bằng số ("30 (ba mươi) ngày tuổi đến 70 tuổi…") trông
-    y hệt một đề mục sau khi PDF cắt dòng. Nhận nhầm một dòng như vậy không chỉ
-    đẻ ra một mục ma: mọi mục thật phía sau tụt xuống làm con của nó, và title
-    của toàn bộ chunk bên dưới sai theo. Số của đề mục thật luôn nối tiếp dãy
-    đang mở, số trong câu văn thì không.
+    A sentence starting with a number ("30 (ba mươi) ngày tuổi đến 70 tuổi…")
+    looks exactly like a heading once PDF extraction wraps the line. Mistaking
+    one does more than spawn a phantom section: every real section after it drops
+    down to become its child, and the titles of every chunk below go wrong with
+    it. A real heading's number always continues the open sequence; a number
+    inside a sentence does not.
     """
     if prev is None:
         return True
     depth = len(num)
     if depth <= len(prev) and num[:depth - 1] == prev[:depth - 1]:
-        # cùng một nhánh: đi tiếp (chừa chỗ cho một mục bị trích xuất sót)
-        # hoặc mở lại dãy từ đầu
+        # same branch: continue (leaving room for a section extraction missed)
+        # or restart the sequence from the beginning
         reference = prev[depth - 1]
         return num[-1] == 1 or reference < num[-1] <= reference + 2
     if depth >= 2 and depth <= len(prev) + 1 and num[-1] == 1:
-        # mục con đầu tiên của một nhánh khác — nhánh đó cũng phải nối tiếp
-        # được ("2.2.5" rồi tới "2.3.1" khi tiêu đề "2.3" bị trích xuất sót)
+        # the first child of a different branch — that branch has to continue the
+        # sequence too ("2.2.5" then "2.3.1" when the "2.3" heading was missed)
         parent = num[:-1]
         return (parent == prev[:len(parent)]
                 or _continues_sequence(parent, prev))
@@ -391,17 +404,17 @@ def _continues_sequence(num: tuple[int, ...], prev: tuple[int, ...] | None) -> b
 
 
 def _drop_broken_sequence(marked: list[tuple]) -> list[tuple]:
-    """Loại các đề mục số không nối được vào dãy nào.
+    """Drop numbered headings that continue no sequence.
 
-    Chỉ soát các chỉ mục đoán từ hình thức. Chỉ mục do Word sinh ra là cấu
-    trúc thật của tài liệu, không phải phỏng đoán, nên luôn được giữ.
+    Only numbers inferred from typography are checked. Numbers Word generated are
+    the document's real structure rather than a guess, so they are always kept.
     """
     out: list[tuple] = []
     prev: tuple[int, ...] | None = None
     for entry in marked:
         _block, num, _title, _rank, kind, from_word = entry
         if kind != "decimal":
-            prev = None                        # PHẦN/ĐIỀU/Phụ lục mở dãy mới
+            prev = None                        # PHẦN/ĐIỀU/Phụ lục opens a new sequence
             out.append(entry)
             continue
         counter = _as_counter(num)
@@ -417,12 +430,13 @@ def _drop_broken_sequence(marked: list[tuple]) -> list[tuple]:
 
 
 def _is_banner(block: Block, body_size: float) -> bool:
-    """Dòng này có phải một tiêu đề lớn không đánh số không?
+    """Is this line an unnumbered banner heading?
 
-    Ba dấu hiệu phải cùng có mặt: **cỡ chữ lớn hơn hẳn nội dung**, **viết hoa
-    gần như toàn bộ** và **không mang chỉ mục nào**. Câu văn thường không bao
-    giờ hội đủ cả ba, nên luật này gần như không bắt nhầm — điều quan trọng, vì
-    một tiêu đề lớn nhận nhầm sẽ nuốt trọn phần tài liệu đứng sau nó.
+    Three cues must all be present: **clearly larger than the body text**,
+    **almost entirely uppercase** and **carrying no section number**. Ordinary
+    prose never satisfies all three, so this rule almost never misfires — which
+    matters, because a misdetected banner swallows the whole part of the document
+    that follows it.
     """
     if block.is_table or block.kind == "figure" or block.number:
         return False
@@ -436,8 +450,8 @@ def _is_banner(block: Block, body_size: float) -> bool:
     letters = [c for c in text if c.isalpha()]
     if not letters or len(letters) / len(text) < 0.5:
         return False
-    # Công thức toán ("L = M *T *R") cũng in cỡ lớn và toàn chữ hoa. Tiêu đề
-    # thật là một cụm từ: phải có ít nhất hai từ dài từ hai chữ cái trở lên.
+    # A formula ("L = M *T *R") is also set large and all in capitals. A real
+    # heading is a phrase: it needs at least two words of two or more letters.
     if sum(1 for w in text.split() if len(w) >= 2 and w.isalpha()) < 2:
         return False
     upper = sum(1 for c in letters if c.isupper()) / len(letters)
@@ -445,12 +459,12 @@ def _is_banner(block: Block, body_size: float) -> bool:
 
 
 def _mark_banners(blocks: list[Block]) -> list[tuple[Block, str, str, int, str, bool]]:
-    """Tìm các tiêu đề lớn không đánh số, gộp những dòng liền nhau làm một.
+    """Find the unnumbered banner headings, joining adjacent lines into one.
 
-    Tiêu đề lớn hay được xuống dòng giữa chừng ("QUY ĐỊNH" / "SẢN PHẨM TIẾT
-    KIỆM LINH HOẠT" ở hai cỡ chữ khác nhau), và bước nối dòng phía trước không
-    nối chúng lại vì khác cỡ chữ. Để rời thì cây chỉ mục có hai nhánh cụt thay
-    vì một tiêu đề.
+    A banner is often broken across lines ("QUY ĐỊNH" / "SẢN PHẨM TIẾT KIỆM
+    LINH HOẠT" at two different sizes), and the earlier line-joining step leaves
+    them apart because the sizes differ. Left split, the outline grows two stub
+    branches in place of one heading.
     """
     body_size = next((b.meta.get("body_size") for b in blocks
                       if b.meta.get("body_size")), 0.0)
@@ -480,16 +494,16 @@ def _mark_banners(blocks: list[Block]) -> list[tuple[Block, str, str, int, str, 
         head = run[0]
         title = clean_text(" ".join(b.text for b in run))
         for extra in run[1:]:
-            extra.text = ""                # chữ đã dồn lên dòng đầu của tiêu đề
+            extra.text = ""                # text moved up onto the heading's first line
         head.text = title
         marked.append((head, "", title, RANK_BANNER, "banner", False))
     return marked
 
 
 def detect_headings(blocks: list[Block], source: str) -> list[Block]:
-    """Đánh dấu block nào là tiêu đề, gán number/level cho chúng."""
+    """Mark which blocks are headings and assign them a number and level."""
     ranks_seen: set[int] = set()
-    # (block, số mục, tên mục, rank, loại, chỉ mục do Word sinh?)
+    # (block, number, name, rank, kind, was the number generated by Word?)
     marked: list[tuple[Block, str, str, int, str, bool]] = []
     banners = {id(entry[0]): entry for entry in _mark_banners(blocks)}
 
@@ -504,10 +518,10 @@ def detect_headings(blocks: list[Block], source: str) -> list[Block]:
         text = block.text
         if not text.strip():
             continue
-        word_number = block.number      # chỉ mục do Word sinh ra (chỉ có ở DOCX)
+        word_number = block.number      # a Word-generated number (DOCX only)
 
-        # Tiêu đề gõ tay (PHẦN, ĐIỀU, Phụ lục...) được ưu tiên nhận diện trước,
-        # kể cả khi paragraph đó cũng nằm trong một danh sách đánh số.
+        # Hand-typed headings (PHẦN, ĐIỀU, Phụ lục…) are recognised first, even
+        # when the paragraph also sits inside a numbered list.
         hit = _match_heading(text)
         if hit and hit[3] in ("part", "chapter", "appendix", "section", "article"):
             num, title, rank, kind = hit
@@ -517,8 +531,8 @@ def detect_headings(blocks: list[Block], source: str) -> list[Block]:
                 continue
 
         if word_number:
-            # Word đã cho biết chỉ mục -> giữ nguyên định dạng gốc ("1.", "a)",
-            # "1.1.") thay vì đoán lại, nhưng thứ bậc thì suy từ ký hiệu.
+            # Word gave the number -> keep its original form ("1.", "a)", "1.1.")
+            # rather than re-deriving it, but infer the level from the marker.
             rank = _word_rank(word_number, block.meta.get("list_format", ""),
                               block.level or 1)
             if _looks_like_heading(block, text, text, "decimal", True):
@@ -537,7 +551,7 @@ def detect_headings(blocks: list[Block], source: str) -> list[Block]:
     marked = _drop_broken_sequence(marked)
     labels = _flat_column_labels(marked)
 
-    # Nén các rank thực sự xuất hiện thành cấp liên tiếp 1,2,3...
+    # Compress the ranks that actually occur into consecutive levels 1, 2, 3…
     ranks_seen = {rank for _b, _n, _t, rank, _k, _w in marked}
     order = {rank: i + 1 for i, rank in enumerate(sorted(ranks_seen))}
 
@@ -546,10 +560,10 @@ def detect_headings(blocks: list[Block], source: str) -> list[Block]:
         block.number = num
         block.level = order[rank]
         block.meta["heading_kind"] = kind
-        # Hàng nối tiếp của bảng làm phẳng: tên cột không phải tên mục
+        # Continuation row of a flattened table: a column label is not a name
         named = _drop_column_label(title, labels) if labels else title
-        # Tiêu đề dạng "Phụ lục 01" không có phần tên riêng; lấy block.text làm
-        # tiêu đề sẽ thành "Phụ lục 01 Phụ lục 01" trong đường dẫn mục lục.
+        # A heading like "Phụ lục 01" has no name of its own; using block.text as
+        # the title would render "Phụ lục 01 Phụ lục 01" in the outline path.
         if named:
             block.meta["title"] = named
         elif title or clean_text(block.text) == clean_text(num):
@@ -567,7 +581,7 @@ def _section_tokens(section: Section) -> int:
 
 
 def _branch_paths(sections: list[Section]) -> set[tuple[str, ...]]:
-    """Đường dẫn của những mục còn mục con bên dưới."""
+    """Paths of the sections that still have children beneath them."""
     branches: set[tuple[str, ...]] = set()
     for section in sections:
         for depth in range(1, len(section.path)):
@@ -576,10 +590,10 @@ def _branch_paths(sections: list[Section]) -> set[tuple[str, ...]]:
 
 
 def _adjacent_in_tree(a: Section, b: Section) -> bool:
-    """Hai mục đứng cạnh nhau có cùng thuộc một nhánh không?
+    """Do two adjacent sections belong to the same branch?
 
-    Chỉ mục anh em (cùng mục cha) hoặc quan hệ cha – con mới được gộp; gộp hai
-    mục ở hai nhánh khác nhau là trộn hai chủ đề vào một vector.
+    Only siblings (sharing a parent) or a parent-child pair may be merged;
+    merging across two branches mixes two topics into one vector.
     """
     return (a.path[:-1] == b.path[:-1]
             or a.path[:-1] == b.path
@@ -587,11 +601,12 @@ def _adjacent_in_tree(a: Section, b: Section) -> bool:
 
 
 def _absorb_section(target: Section, section: Section) -> None:
-    """Dồn toàn bộ nội dung của `section` vào cuối `target`."""
+    """Move all of `section`'s content onto the end of `target`."""
     moved = list(section.blocks)
     if section.heading_text:
-        # Dòng tiêu đề của mục bị gộp thường là nửa đầu của câu, nửa sau
-        # nằm ở khối ngay sau nó — nối lại thay vì để vỡ làm đôi.
+        # The absorbed section's heading line is usually the first half of a
+        # sentence whose second half is in the block right after it — join them
+        # rather than leaving it broken in two.
         if moved and continues_sentence(section.heading_text, moved[0].text):
             moved[0] = Block(text=f"{section.heading_text} {moved[0].text}",
                              page=moved[0].page, kind=moved[0].kind,
@@ -607,27 +622,28 @@ def _absorb_section(target: Section, section: Section) -> None:
 
 def merge_short_sections(sections: list[Section], min_tokens: int,
                          max_tokens: int) -> list[Section]:
-    """Gộp mục quá ngắn với mục liền kề để chunk không bị vụn.
+    """Merge sections that are too short so the chunks do not come out in shreds.
 
-    Danh mục định nghĩa kiểu "1.1 … 1.60", mỗi mục một hai dòng, cho ra hàng
-    chục chunk chỉ vài chục token — vector của chúng gần như không mang thông
-    tin. Gộp lại thì mất nút đó trong cây chỉ mục, nhưng *không mất chữ*: dòng
-    tiêu đề được đưa xuống thành đoạn mở đầu của phần nội dung.
+    A glossary running "1.1 … 1.60", one or two lines per entry, yields dozens of
+    chunks of a few dozen tokens each — vectors carrying almost no information.
+    Merging loses that node from the outline but *loses no words*: the heading
+    line moves down to open the body.
 
-    Xét **cả mục trên lẫn mục dưới**, và mỗi vòng chỉ gộp một cặp: lấy mục ngắn
-    nhất còn lại rồi ghép nó vào người hàng xóm *nhỏ hơn*. Chỉ nhìn về phía
-    trước thì một mục ngắn nằm ngay sau một mục đồ sộ sẽ mắc kẹt vĩnh viễn — đó
-    chính là lý do "Điều 1" một trăm token vẫn đứng riêng ngay dưới "MỤC LỤC"
-    tám trăm token. Ưu tiên người hàng xóm nhỏ hơn để các mục sau khi gộp dài
-    xấp xỉ nhau thay vì một khối phình to bên cạnh mấy mẩu vụn.
+    **Both neighbours are considered**, and each round merges exactly one pair:
+    take the shortest remaining section and join it to its *smaller* neighbour.
+    Looking only backwards leaves a short section stranded forever behind a huge
+    one — precisely why a hundred-token "Điều 1" stayed on its own right below an
+    eight-hundred-token "MỤC LỤC". Preferring the smaller neighbour keeps the
+    merged sections roughly equal in length instead of producing one bloated
+    block beside a handful of scraps.
 
-    Vòng lặp chạy tới khi không còn cặp nào gộp được, nhờ vậy một mục cha vừa
-    nuốt hết mục con của nó sẽ được xét lại — bước gộp một lượt bỏ sót hẳn
-    trường hợp này.
+    The loop runs until no mergeable pair is left, so a parent that has just
+    absorbed all its children is reconsidered — a single-pass merge misses that
+    case entirely.
 
-    Chỉ mục bị nuốt phải là mục không còn mục con (gộp là xoá mất một nhánh),
-    hai mục phải cùng một nhánh, và tổng vẫn phải nằm trong trần token *đã trừ
-    tiền tố mục lục* mà mọi chunk phải mang theo.
+    The absorbed section must be a leaf (merging one with children would delete a
+    branch), the two must share a branch, and the total must still fit the token
+    ceiling *minus the outline prefix* that every chunk has to carry.
     """
     if min_tokens <= 0:
         return sections
@@ -654,15 +670,15 @@ def merge_short_sections(sections: list[Section], min_tokens: int,
                 if not _adjacent_in_tree(section, neighbour):
                     continue
                 left, right = (out[i], out[j]) if j > i else (out[j], out[i])
-                # Mục đứng sau là mục bị nuốt: nó phải là mục cụt nhánh, còn
-                # mục đứng trước giữ nguyên chỗ của nó trong cây.
+                # The later section is the one absorbed: it has to be a leaf,
+                # while the earlier one keeps its place in the tree.
                 if tuple(right.path) in branches:
                     continue
                 sibling = left.path[:-1] == right.path[:-1]
-                # Trần 512 token là trần của *chunk*, mà chunk còn mang cả tiền
-                # tố mục lục ở đầu. Bỏ quên tiền tố thì mục gộp xong vẫn bị khâu
-                # chunk cắt làm đôi — gộp thành công cốc, lại còn đẻ ra hai
-                # chunk cùng tên.
+                # The 512-token ceiling is the *chunk* ceiling, and a chunk also
+                # carries the outline prefix at its head. Forget the prefix and
+                # the merged section is split in two by the chunker anyway — the
+                # merge achieves nothing and produces two chunks with one name.
                 room = max_tokens - _prefix_tokens(left, right if sibling else None)
                 if size[id(left)] + size[id(right)] > room:
                     continue
@@ -680,21 +696,21 @@ def merge_short_sections(sections: list[Section], min_tokens: int,
 
 
 def _absorb_index(target: Section, section: Section) -> None:
-    """Cộng chỉ mục của mục bị gộp vào mục đích: 1.1 nuốt 1.2 -> "1.1 + 1.2".
+    """Add the absorbed section's number to the target: 1.1 takes 1.2 -> "1.1 + 1.2".
 
-    Gộp nội dung mà giữ nguyên chỉ mục cũ thì cây chỉ mục nói dối: chunk mang
-    title "1.1 Mục đích" nhưng bên trong có cả phần 1.2. Cộng chỉ mục vào thì
-    tra theo số mục vẫn ra đúng chunk đang chứa nó.
+    Merge the content while keeping the old number and the outline lies: the
+    chunk is titled "1.1 Mục đích" while holding all of 1.2 as well. Adding the
+    number keeps a lookup by section number landing on the chunk that holds it.
 
-    Chỉ cộng khi gộp hai mục ngang hàng. Mục con gộp lên mục cha thì chỉ mục
-    của cha vốn đã bao mục con rồi, thêm vào chỉ dài dòng.
+    Numbers are only combined for two siblings. When a child merges up into its
+    parent, the parent's number already covers the child and adding it is noise.
     """
     target.number, target.title = _merged_index(target, section)
     target.display_title = _join_names(
         _merged_names(target.display_title, section.display_title),
         MAX_TITLE_IN_HEADING)
-    # Đường dẫn của mục này đổi theo; mục con thì không có (chỉ mục không còn
-    # con mới được gộp), nên không có nhánh nào bên dưới bị lệch đường dẫn.
+    # This section's path changes with it; it has no children (only leaves are
+    # ever absorbed), so no branch below is left with a stale path.
     target.path = target.path[:-1] + [target.heading_str]
 
 
@@ -706,7 +722,7 @@ def _merged_names(kept: str, added: str) -> list[str]:
 
 
 def _merged_index(target: Section, section: Section) -> tuple[str, str]:
-    """Số mục và tên mục của `target` sau khi nó nuốt `section`."""
+    """The number and name of `target` after it absorbs `section`."""
     numbers = [n for n in dict.fromkeys(target.number.split(" + ")
                                         + [section.number]) if n]
     names = _merged_names(target.title, section.title)
@@ -714,7 +730,7 @@ def _merged_index(target: Section, section: Section) -> tuple[str, str]:
 
 
 def _prefix_tokens(target: Section, absorbing: Section | None) -> int:
-    """Số token của tiền tố mục lục mà mọi chunk của `target` phải mang theo."""
+    """Tokens of the outline prefix every chunk of `target` has to carry."""
     from .chunker import est_tokens
 
     path = target.path
@@ -728,11 +744,11 @@ _MORE = "…"
 
 
 def _join_names(names: list[str], limit: int = MAX_TITLE_IN_PATH) -> str:
-    """Nối tên các mục đã gộp, cắt bớt khi vượt trần độ dài của đường dẫn.
+    """Join the names of merged sections, trimming past the path length ceiling.
 
-    Số mục thì giữ đủ — đó mới là chỉ mục để tra cứu. Tên chỉ để người đọc hiểu
-    mục nói về gì, gộp năm sáu cái lại thì tiền tố của chunk phình lên và ăn
-    mất ngân sách token dành cho nội dung.
+    Numbers are kept in full — those are what a lookup uses. Names only tell the
+    reader what the section is about, and joining five or six of them bloats the
+    chunk prefix and eats the token budget meant for content.
     """
     out: list[str] = []
     used = 0
@@ -746,11 +762,12 @@ def _join_names(names: list[str], limit: int = MAX_TITLE_IN_PATH) -> str:
 
 
 def _demote(block: Block) -> None:
-    """Hạ một đề mục xuống thành dòng nội dung thường, giữ nguyên số mục.
+    """Demote a heading to an ordinary content line, keeping its number.
 
-    DOCX giữ số mục ở `block.number` chứ không nằm trong text (Word tự sinh khi
-    hiển thị), nên phải ghép lại — bỏ đi thì tài liệu dựng lại mất hẳn phần
-    đánh số và người đọc không đối chiếu được với bản gốc nữa.
+    In DOCX the number lives in `block.number` rather than in the text (Word
+    generates it at display time), so it has to be spliced back in — drop it and
+    the rebuilt document loses its numbering entirely, leaving readers unable to
+    check it against the original.
     """
     number = (block.number or "").strip()
     if number and not clean_text(block.text).startswith(number):
@@ -763,20 +780,20 @@ def _demote(block: Block) -> None:
 
 
 def build_sections(blocks: list[Block]) -> list[Section]:
-    """Gom block vào các mục, giữ nguyên thứ tự tài liệu.
+    """Group blocks into sections, preserving document order.
 
-    Nội dung thuộc về tiêu đề gần nhất phía trên, bất kể nó nằm ở trang nào —
-    đây là cách xử lý trường hợp một mục trải dài qua nhiều trang.
+    Content belongs to the nearest heading above it, whatever page that heading
+    is on — which is how a section spanning several pages is handled.
     """
     sections: list[Section] = []
-    stack: list[Section] = []          # ngăn xếp tiêu đề tổ tiên đang mở
-    ranks: list[int] = []              # cấp suy ra từ ký hiệu, dùng để so sánh cha/con
+    stack: list[Section] = []          # stack of currently open ancestor headings
+    ranks: list[int] = []              # marker-derived levels, for parent/child comparison
     preamble: Section | None = None
 
     for block in blocks:
         if block.kind == "heading":
             level = block.level or 1
-            # Phần mở đầu (bìa, lời dẫn) không phải mục cha của bất kỳ mục nào
+            # The preamble (cover, opening remarks) parents no section
             if stack and stack[0] is preamble:
                 stack.clear()
                 ranks.clear()
@@ -785,9 +802,9 @@ def build_sections(blocks: list[Block]) -> list[Section]:
                 ranks.pop()
 
             if len(stack) + 1 > MAX_TREE_LEVEL:
-                # Sâu quá mức cây cho phép: dòng này thôi làm nhánh, trở lại
-                # thành một dòng nội dung bình thường của mục cha. Số mục được
-                # ghép vào text để không mất thông tin đánh số của tài liệu.
+                # Deeper than the tree allows: this line stops being a branch and
+                # returns to being ordinary content of its parent. The number is
+                # spliced into the text so the document's numbering is not lost.
                 _demote(block)
                 if stack:
                     stack[-1].blocks.append(block)
@@ -795,9 +812,9 @@ def build_sections(blocks: list[Block]) -> list[Section]:
                         ancestor.page_end = max(ancestor.page_end, block.page)
                     continue
 
-            # Tên rỗng là kết luận đã chốt ở khâu nhận diện ("Phụ lục 01" không
-            # có tên riêng, hàng nối tiếp của bảng làm phẳng cũng vậy), không
-            # phải chỗ thiếu để lấy block.text bù vào.
+            # An empty name is a settled conclusion from detection ("Phụ lục 01"
+            # has no name of its own, nor does a flattened table's continuation
+            # row) — not a gap to be filled in from block.text.
             full_title = block.meta.get("title", block.text)
             title = shorten_title(full_title)
             shown = shorten_title(full_title, MAX_TITLE_IN_HEADING)
@@ -809,7 +826,7 @@ def build_sections(blocks: list[Block]) -> list[Section]:
                 display_title=shown,
                 own_title=shown,
                 full_heading=f"{block.number} {full_title}".strip(),
-                # cấp hiển thị = độ sâu thật trong cây, để không nhảy cóc
+                # displayed level = true depth in the tree, so no level is skipped
                 level=len(stack) + 1,
                 path=path,
                 page_start=block.page,
@@ -821,7 +838,7 @@ def build_sections(blocks: list[Block]) -> list[Section]:
             continue
 
         if not sections:
-            # nội dung nằm trước tiêu đề đầu tiên (trang bìa, lời mở đầu)
+            # content before the first heading (cover page, opening remarks)
             if preamble is None:
                 preamble = Section(number="", title=PREAMBLE_TITLE, level=1,
                                    path=[PREAMBLE_TITLE], page_start=block.page,
@@ -835,7 +852,7 @@ def build_sections(blocks: list[Block]) -> list[Section]:
         current = stack[-1] if stack else sections[-1]
         current.blocks.append(block)
         current.page_end = max(current.page_end, block.page)
-        # mục cha cũng phải mở rộng phạm vi trang để metadata nhất quán
+        # ancestors extend their page range too, to keep the metadata consistent
         for ancestor in stack:
             ancestor.page_end = max(ancestor.page_end, block.page)
 

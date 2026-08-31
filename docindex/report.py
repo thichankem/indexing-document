@@ -1,4 +1,4 @@
-"""Kiểm tra chất lượng chunk trước khi đưa vào embedding."""
+"""Quality checks run on the chunks before they reach the embedding step."""
 from __future__ import annotations
 
 import statistics
@@ -7,11 +7,12 @@ import re
 
 from .chunker import ChunkConfig
 from .layout import MAX_TREE_DEPTH
-from .models import Chunk, Section
+from .models import PREAMBLE_TITLE, Chunk, Section
 
-# Mẩu chữ cụt đầu dòng ("h hàng là...") báo hiệu file nguồn rơi ký tự khi tạo
-# PDF. Chỉ xét mẩu một chữ cái, vì mẩu hai chữ cái trùng với rất nhiều từ tiếng
-# Việt hợp lệ ("là", "và", "có"…) và sẽ báo động giả hàng loạt.
+# A clipped fragment at the start of a line ("h hàng là...") means the source
+# file dropped characters while the PDF was produced. Only one-letter fragments
+# are considered: two-letter fragments collide with plenty of valid Vietnamese
+# words ("là", "và", "có"…) and would raise false alarms by the hundred.
 _ONE_LETTER_WORDS = {"ở", "à", "ừ", "ê", "ơ", "y", "a", "ý"}
 _TRUNCATED = re.compile(r"^([^\W\d_])\s+([^\W\d_]{2,})", re.U)
 
@@ -30,17 +31,17 @@ def _suspect_truncated(chunks: list[Chunk]) -> int:
     return count
 
 
-# Từ tỉ lệ này trở lên số trang không có lớp text thì tài liệu là bản scan
+# At or above this share of pages without a text layer, the file is a scan
 SCAN_PAGE_RATIO = 0.8
 
 
 def scanned_warning(extract_stats: dict | None) -> str:
-    """Câu cảnh báo khi tài liệu là bản scan, chuỗi rỗng nếu không phải.
+    """Warning text for a scanned document; an empty string when it is not one.
 
-    Trang scan là một tấm ảnh chụp cả trang: chữ, logo, đầu/chân trang, mục lục
-    đều là điểm ảnh nằm chung trong đúng một tấm hình. Không có đối tượng riêng
-    nào để gỡ, mà gỡ tấm hình ấy đi thì trang trắng trơn — nên tool không làm
-    được gì cho loại file này ngoài việc nói thẳng ra.
+    A scanned page is one photograph of the whole sheet: text, logo, header,
+    footer and table of contents are all pixels inside a single image. There is
+    no separate object to strip, and stripping the image leaves a blank page —
+    so the only useful thing the tool can do here is say so plainly.
     """
     stats = extract_stats or {}
     total = stats.get("pages_total", 0)
@@ -48,19 +49,19 @@ def scanned_warning(extract_stats: dict | None) -> str:
     if not total or blank < total * SCAN_PAGE_RATIO:
         return ""
     return (
-        f"{blank}/{total} trang không có lớp text — đây là bản scan. Chữ và "
-        "logo nằm chung trong một tấm ảnh chụp cả trang nên không gỡ riêng "
-        "logo được, chunk cũng chỉ có dòng giữ chỗ [HÌNH]. Chạy OCR (hoặc lấy "
-        "bản .docx/.pdf gốc) rồi đưa lại vào tool."
+        f"{blank}/{total} pages have no text layer — this is a scan. Text and "
+        "logo share a single full-page image, so the logo cannot be stripped "
+        "on its own and the chunks hold nothing but [FIGURE] placeholders. Run "
+        "OCR (or fetch the original .docx/.pdf) and feed it back in."
     )
 
 
 def outline(sections: list[Section]) -> list[dict]:
-    """Cây chỉ mục của tài liệu, để đối chiếu với văn bản gốc.
+    """The document's outline tree, for checking against the original text.
 
-    Hệ RAG dựng title của chunk từ cây này, nên sai một cấp ở đây là sai title
-    của mọi chunk bên dưới. Xuất ra thành danh sách phẳng kèm cấp để người dùng
-    soát nhanh bằng mắt.
+    A RAG stack builds every chunk title from this tree, so one wrong level
+    here is a wrong title on every chunk below it. Returned as a flat list with
+    levels attached, so it can be eyeballed quickly.
     """
     return [
         {"level": s.level, "number": s.number, "title": s.title,
@@ -70,8 +71,8 @@ def outline(sections: list[Section]) -> list[dict]:
 
 
 def format_outline(sections: list[Section], doc_title: str = "") -> str:
-    """In cây chỉ mục ra dạng thụt lề để đọc bằng mắt."""
-    lines = [f"[tài liệu] {doc_title}"] if doc_title else []
+    """Render the outline tree as indented text for human review."""
+    lines = [f"[document] {doc_title}"] if doc_title else []
     for node in outline(sections):
         indent = "   " * node["level"]
         number = f"{node['number']} " if node["number"] else ""
@@ -81,13 +82,15 @@ def format_outline(sections: list[Section], doc_title: str = "") -> str:
 
 def check(chunks: list[Chunk], sections: list[Section], cfg: ChunkConfig,
           extract_stats: dict | None = None) -> dict:
-    """Soát lỗi thường gặp và trả về báo cáo tóm tắt cho từng tài liệu."""
+    """Check for the usual problems and return a per-document summary report."""
     warnings: list[str] = []
     lengths = [c.char_count for c in chunks]
 
-    no_section = [c for c in chunks if not c.section_path or c.section_path == "Phần mở đầu"]
-    # Trần token là ràng buộc cứng của khâu embedding: vượt là bị cắt cụt, nên
-    # không nới thêm dung sai như khi đo bằng ký tự.
+    no_section = [c for c in chunks
+                  if not c.section_path or c.section_path == PREAMBLE_TITLE]
+    # The token ceiling is a hard constraint of the embedding step: go over it
+    # and the text is truncated, so no tolerance is added the way it is for
+    # character counts.
     too_long = [c for c in chunks if c.est_tokens > cfg.max_tokens]
     too_short = [c for c in chunks if c.est_tokens < 30]
     cross_page = [c for c in chunks if c.page <= 0]
@@ -95,49 +98,52 @@ def check(chunks: list[Chunk], sections: list[Section], cfg: ChunkConfig,
 
     for chunk in chunks:
         if chunk.est_tokens > cfg.max_tokens:
-            chunk.warnings.append("vượt trần token")
+            chunk.warnings.append("over the token ceiling")
         if chunk.est_tokens < 30:
-            chunk.warnings.append("quá ngắn, ngữ nghĩa yếu")
-        if not chunk.section_number and chunk.section_path == "Phần mở đầu":
-            chunk.warnings.append("không thuộc mục nào")
+            chunk.warnings.append("too short, weak semantics")
+        if not chunk.section_number and chunk.section_path == PREAMBLE_TITLE:
+            chunk.warnings.append("belongs to no section")
 
     scanned = scanned_warning(extract_stats)
     if scanned:
         warnings.append(scanned)
     if not chunks:
         warnings.append(
-            "Không tạo được chunk nào — file rỗng, hoặc là bản scan chưa có "
-            "lớp text (cần chạy OCR trước khi đưa vào tool)"
+            "No chunks were produced — the file is empty, or it is a scan with "
+            "no text layer (run OCR before feeding it to the tool)"
         )
     if len(no_section) > len(chunks) * 0.3 and chunks:
         warnings.append(
-            f"{len(no_section)}/{len(chunks)} chunk không gắn được vào mục nào "
-            "— nhiều khả năng tiêu đề bị nhận sai"
+            f"{len(no_section)}/{len(chunks)} chunks could not be attached to a "
+            "section — headings were most likely detected wrongly"
         )
     if too_long:
         warnings.append(
-            f"{len(too_long)} chunk vượt trần {cfg.max_tokens} token — phía "
-            "embedding sẽ cắt cụt phần thừa"
+            f"{len(too_long)} chunks exceed the {cfg.max_tokens} token ceiling "
+            "— the embedding step will truncate the overflow"
         )
 
-    # Tên mục mở đầu bằng chữ thường là dấu hiệu file nguồn rơi mất mấy ký tự
-    # đầu dòng ("Phương thức trả nợ" -> "ng thức trả nợ"). Tiêu đề tiếng Việt
-    # luôn viết hoa chữ đầu nên tín hiệu này hầu như không báo nhầm, mà mắt
-    # thường thì rất dễ bỏ qua giữa một cây chỉ mục dài.
+    # A section name starting in lowercase means the source file lost a few
+    # characters at the start of the line ("Phương thức trả nợ" -> "ng thức trả
+    # nợ"). Vietnamese headings always capitalise the first letter, so this
+    # signal almost never misfires — and the eye misses it easily in a long
+    # outline.
     lost_head = [s for s in sections
                  if s.title[:1].isalpha() and s.title[:1].islower()]
     if lost_head:
         warnings.append(
-            f"{len(lost_head)} tên mục mở đầu bằng chữ thường "
-            f"(vd \"{lost_head[0].number} {lost_head[0].title[:40]}\") — file "
-            "nguồn rơi ký tự đầu dòng, nên lấy lại bản gốc (.docx) nếu có"
+            f"{len(lost_head)} section names start in lowercase "
+            f"(e.g. \"{lost_head[0].number} {lost_head[0].title[:40]}\") — the "
+            "source file lost leading characters; fetch the original .docx if "
+            "you still have it"
         )
 
     truncated = _suspect_truncated(chunks)
     if truncated:
         warnings.append(
-            f"{truncated} dòng nghi bị rơi ký tự đầu — lỗi từ file nguồn khi "
-            "tạo PDF, nên lấy lại bản gốc (.docx) nếu có"
+            f"{truncated} lines look like they lost leading characters — a fault "
+            "in the source file when the PDF was produced; fetch the original "
+            ".docx if you still have it"
         )
 
     pages = {c.page for c in chunks}
@@ -149,8 +155,9 @@ def check(chunks: list[Chunk], sections: list[Section], cfg: ChunkConfig,
     depth = max((n["level"] for n in tree), default=0)
     if depth > MAX_TREE_DEPTH:
         warnings.append(
-            f"cây chỉ mục sâu {depth} cấp, quá {MAX_TREE_DEPTH} cấp hệ RAG đọc "
-            "được — các mục sâu nhất sẽ bị gộp vào cấp cuối"
+            f"the outline is {depth} levels deep, past the {MAX_TREE_DEPTH} "
+            "levels a RAG stack reads — the deepest sections are folded into "
+            "the last level"
         )
 
     return {
@@ -188,20 +195,20 @@ def check(chunks: list[Chunk], sections: list[Section], cfg: ChunkConfig,
 
 def format_report(name: str, stats: dict) -> str:
     lines = [
-        f"  chunk={stats['chunks']:<5} mục={stats['sections']:<4} "
-        f"tiêu đề={stats['headings_detected']:<4} trang={stats['pages_covered']}"
-        f" | cây chỉ mục sâu {stats['outline_depth']} cấp",
-        f"  token: trung vị={stats['tokens_median']} max={stats['tokens_max']}"
-        f"/{stats['token_limit']} | ký tự: trung vị={stats['chars_median']} "
+        f"  chunks={stats['chunks']:<5} sections={stats['sections']:<4} "
+        f"headings={stats['headings_detected']:<4} pages={stats['pages_covered']}"
+        f" | outline depth {stats['outline_depth']}",
+        f"  tokens: median={stats['tokens_median']} max={stats['tokens_max']}"
+        f"/{stats['token_limit']} | chars: median={stats['chars_median']} "
         f"max={stats['chars_max']}",
-        f"  mục trải nhiều chunk={stats['chunks_multi_page_sections']} "
-        f"| quá dài={stats['too_long']} quá ngắn={stats['too_short']} "
-        f"không thuộc mục={stats['orphan']}",
-        f"  đã lọc: logo={stats['logos_dropped']} "
-        f"dòng chân/đầu trang={stats['boilerplate_lines_dropped']} "
-        f"cước chú={stats['footnote_lines_dropped']} "
-        f"| giữ lại hình={stats['figures_kept']}"
-        + (f" (trong đó {stats['diagrams_found']} lưu đồ)"
+        f"  sections split across chunks={stats['chunks_multi_page_sections']} "
+        f"| too long={stats['too_long']} too short={stats['too_short']} "
+        f"orphan={stats['orphan']}",
+        f"  filtered: logos={stats['logos_dropped']} "
+        f"header/footer lines={stats['boilerplate_lines_dropped']} "
+        f"footnotes={stats['footnote_lines_dropped']} "
+        f"| figures kept={stats['figures_kept']}"
+        + (f" (of which {stats['diagrams_found']} diagrams)"
            if stats.get("diagrams_found") else ""),
     ]
     for w in stats["warnings"]:

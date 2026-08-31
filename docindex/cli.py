@@ -1,4 +1,4 @@
-"""Giao diện dòng lệnh: xử lý một file hoặc cả thư mục thành chunk JSONL."""
+"""Command line interface: turn a single file or a whole folder into JSONL chunks."""
 from __future__ import annotations
 
 import argparse
@@ -14,7 +14,7 @@ from .report import check, format_outline, format_report, scanned_warning
 
 
 def _stdout_utf8() -> None:
-    """Console Windows mặc định không in được tiếng Việt."""
+    """The default Windows console cannot print non-ASCII text."""
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -25,50 +25,50 @@ def _stdout_utf8() -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="docindex",
-        description="Chia PDF/DOCX thành chunk theo mục lục, mỗi chunk gọn trong một trang.",
+        description="Split PDF/DOCX documents into outline-aware chunks, each fitting inside one page.",
     )
-    p.add_argument("input", help="File .pdf/.docx hoặc thư mục chứa chúng")
-    p.add_argument("-o", "--output", default="output", help="Thư mục kết quả (mặc định: output)")
+    p.add_argument("input", help="A .pdf/.docx file, or a folder containing them")
+    p.add_argument("-o", "--output", default="output", help="Output folder (default: output)")
     p.add_argument("--max-tokens", type=int, default=MAX_TOKENS,
-                   help=f"Trần token của một chunk (mặc định: {MAX_TOKENS})")
+                   help=f"Token ceiling for a single chunk (default: {MAX_TOKENS})")
     p.add_argument("--min-tokens", type=int, default=MIN_TOKENS,
-                   help="Ngưỡng gộp chunk quá ngắn (token)")
+                   help="Threshold below which short sections are merged (tokens)")
     p.add_argument("--overlap", type=int, default=1,
-                   help="Số câu lặp lại khi một mục bị cắt ngang trang (0 = tắt)")
+                   help="Sentences repeated when a section is split across pages (0 = off)")
     p.add_argument("--keep-short-sections", action="store_true",
-                   help="Giữ nguyên mục quá ngắn thay vì gộp vào mục liền trước")
+                   help="Keep very short sections instead of merging them into a neighbour")
     p.add_argument("--no-prefix", action="store_true",
-                   help="Không chèn đường dẫn mục lục vào nội dung chunk")
-    p.add_argument("--path-depth", type=int, default=4, help="Số cấp mục lục trong tiền tố")
+                   help="Do not prepend the outline path to the chunk text")
+    p.add_argument("--path-depth", type=int, default=4, help="Number of outline levels kept in the prefix")
     p.add_argument("--merge", action="store_true",
-                   help="Gộp tất cả tài liệu vào một file chunks.jsonl duy nhất")
+                   help="Merge every document into a single chunks.jsonl file")
     p.add_argument("--preview", type=int, default=0, metavar="N",
-                   help="In thử N chunk đầu của mỗi tài liệu")
+                   help="Print the first N chunks of each document")
     p.add_argument("--extract-figures", action="store_true",
-                   help="Tách hình minh hoạ ra file PNG trong <output>/figures "
-                        "(bản dựng lại luôn tự tách để nhúng hình vào tài liệu)")
+                   help="Export figures as PNG files into <output>/figures "
+                        "(the rebuilt document always extracts them in order to embed them)")
     p.add_argument("--format", choices=["same", "docx", "pdf"], default="pdf",
-                   help="Định dạng bản tài liệu dựng lại (mặc định: pdf — "
-                        "định dạng mô hình DLA đọc chuẩn nhất)")
+                   help="Format of the rebuilt document (default: pdf — the format "
+                        "a DLA model reads most reliably)")
     p.add_argument("--keep-layout", action="store_true",
-                   help="Giữ nguyên bố cục gốc thay vì dựng lại tài liệu")
+                   help="Keep the original layout instead of rebuilding the document")
     p.add_argument("--page-per-section", action="store_true",
-                   help="Mỗi mục một trang riêng (mặc định: nội dung chảy liên "
-                        "tục như tài liệu bình thường)")
+                   help="Give every section its own page (default: content flows "
+                        "continuously, like an ordinary document)")
     p.add_argument("--outline", action="store_true",
-                   help="In cây chỉ mục của từng tài liệu để đối chiếu với bản gốc")
+                   help="Print each document's outline tree so it can be checked against the original")
     p.add_argument("--no-clean", action="store_true",
-                   help="Không xuất bản tài liệu đã làm sạch")
+                   help="Do not write the cleaned document")
     p.add_argument("--no-jsonl", action="store_true",
-                   help="Không xuất chunk JSONL, chỉ làm sạch tài liệu")
+                   help="Do not write JSONL chunks, only clean the document")
     p.add_argument("--keep-cover", action="store_true",
-                   help="Giữ lại hình bìa ở trang đầu khi làm sạch")
+                   help="Keep the cover image on the first page when cleaning")
     p.add_argument("--keep-logo", action="store_true",
-                   help="Giữ lại logo và hoạ tiết lặp khi giữ bố cục gốc")
+                   help="Keep logos and repeated ornaments when keeping the original layout")
     p.add_argument("--keep-header-footer", action="store_true",
-                   help="Giữ nguyên chữ đầu trang / chân trang khi giữ bố cục gốc")
+                   help="Keep header / footer text when keeping the original layout")
     p.add_argument("--keep-toc", action="store_true",
-                   help="Giữ nguyên phần mục lục khi giữ bố cục gốc")
+                   help="Keep the table of contents when keeping the original layout")
     return p
 
 
@@ -93,11 +93,11 @@ def main(argv: list[str] | None = None) -> int:
         files = [target]
         in_root = os.path.dirname(os.path.abspath(target))
     else:
-        print(f"Không tìm thấy: {target}", file=sys.stderr)
+        print(f"Not found: {target}", file=sys.stderr)
         return 1
 
     if not files:
-        print("Không có file .pdf hoặc .docx nào trong thư mục.", file=sys.stderr)
+        print("No .pdf or .docx files found in that folder.", file=sys.stderr)
         return 1
 
     os.makedirs(args.output, exist_ok=True)
@@ -115,12 +115,12 @@ def main(argv: list[str] | None = None) -> int:
 
     for path in files:
         name = os.path.basename(path)
-        # Cây thư mục đầu vào được giữ nguyên bên kết quả, nếu không hai file
-        # trùng tên ở hai thư mục con sẽ ghi đè lên nhau
+        # The input folder tree is mirrored in the output, otherwise two files
+        # with the same name in different subfolders would overwrite each other
         file_out = out_dir_for(path, in_root, args.output)
         os.makedirs(file_out, exist_ok=True)
         print(f"\n>> {os.path.relpath(path, in_root)}")
-        # Bản dựng lại cần file ảnh để nhúng hình minh hoạ vào tài liệu mới
+        # The rebuilt document needs the image files in order to embed figures
         figure_dir = (os.path.join(args.output, "figures")
                       if args.extract_figures or rebuild else None)
         extract_stats: dict = {}
@@ -128,17 +128,17 @@ def main(argv: list[str] | None = None) -> int:
         try:
             chunks, sections, page_source = process_file(
                 path, cfg, figure_dir=figure_dir, stats=extract_stats)
-        except Exception as exc:  # một file lỗi không nên chặn cả lô
+        except Exception as exc:  # one bad file should not stop the whole batch
             failed += 1
-            print(f"  [LỖI] {type(exc).__name__}: {exc}")
+            print(f"  [ERROR] {type(exc).__name__}: {exc}")
             continue
 
-        # Bản scan thì mọi thứ phía sau đều vô nghĩa — nói ngay, trước khi bỏ
-        # công dựng lại cả tài liệu.
+        # For a scanned document everything downstream is meaningless — say so
+        # right away, before spending the effort of rebuilding it.
         if scanned_warning(extract_stats):
-            print("  [!] bản scan, chưa có lớp text — xem cảnh báo đầy đủ ở dưới")
+            print("  [!] scanned document, no text layer — see the full warning below")
 
-        # Bản tài liệu đã làm sạch
+        # The cleaned document
         if not args.no_clean:
             try:
                 if rebuild:
@@ -148,19 +148,19 @@ def main(argv: list[str] | None = None) -> int:
                         max_tokens=cfg.max_tokens,
                         page_per_section=args.page_per_section)
                     print(f"  -> {os.path.basename(dst)}  "
-                          f"(dựng lại {clean_stats['pages_out']} trang cho "
-                          f"{clean_stats['sections_out']} mục, "
-                          f"giữ {clean_stats['figures_kept']} hình)")
+                          f"(rebuilt {clean_stats['pages_out']} pages for "
+                          f"{clean_stats['sections_out']} sections, "
+                          f"kept {clean_stats['figures_kept']} figures)")
                 else:
                     dst, clean_stats = clean_document(
                         path, file_out, opts=clean_opts)
                     print(f"  -> {os.path.basename(dst)}  "
-                          f"(gỡ {clean_stats['images_removed']} ảnh nhiễu, "
-                          f"giữ {clean_stats['figures_kept']} hình)")
+                          f"(removed {clean_stats['images_removed']} noise images, "
+                          f"kept {clean_stats['figures_kept']} figures)")
                 extract_stats["cleaned_file"] = os.path.basename(dst)
                 extract_stats.update({f"clean_{k}": v for k, v in clean_stats.items()})
             except Exception as exc:
-                print(f"  [LỖI làm sạch] {type(exc).__name__}: {exc}")
+                print(f"  [CLEANING ERROR] {type(exc).__name__}: {exc}")
 
         stats = check(chunks, sections, cfg, extract_stats)
         stats["file"] = os.path.relpath(path, in_root)
@@ -178,8 +178,8 @@ def main(argv: list[str] | None = None) -> int:
         all_chunks.extend(chunks)
 
         for chunk in chunks[: args.preview]:
-            print(f"  --- {chunk.chunk_id} | trang {chunk.page} | "
-                  f"{chunk.est_tokens} token / {chunk.char_count} ký tự")
+            print(f"  --- {chunk.chunk_id} | page {chunk.page} | "
+                  f"{chunk.est_tokens} tokens / {chunk.char_count} chars")
             print("      " + chunk.text[:300].replace("\n", "\n      "))
 
     if args.merge and not args.no_jsonl:
@@ -191,8 +191,8 @@ def main(argv: list[str] | None = None) -> int:
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    print(f"\nTổng: {len(all_chunks)} chunk từ {len(files) - failed}/{len(files)} tài liệu")
-    print(f"Báo cáo: {report_path}")
+    print(f"\nTotal: {len(all_chunks)} chunks from {len(files) - failed}/{len(files)} documents")
+    print(f"Report: {report_path}")
     return 1 if failed and not all_chunks else 0
 
 
